@@ -1,4 +1,4 @@
-import ray, random
+import ray, random, time
 from unstable.utils import setup_logger
 from unstable._types import AgentSpec, GameSpec, GameInformation
 
@@ -56,6 +56,67 @@ class GameScheduler:
         if job_info is None: return # shouldn’t happen
         actor_rs = [game_info.final_rewards[m["pid"]] for m in job_info["models"] if m["type"] == "model" if m["pid"] in game_info.final_rewards]
         opp_rs = [game_info.final_rewards[m["pid"]] for m in job_info["models"] if m["type"] == "opponent" if m["pid"] in game_info.final_rewards]
-        self.env_sampler.update(avg_actor_reward=(sum(actor_rs) / len(actor_rs) if actor_rs else None), avg_opponent_reward=(sum(opp_rs) / len(opp_rs) if opp_rs else None)) # update environment sampling 
+        self.env_sampler.update(avg_actor_reward=(sum(actor_rs) / len(actor_rs) if actor_rs else None), avg_opponent_reward=(sum(opp_rs) / len(opp_rs) if opp_rs else None)) # update environment sampling
         self.model_sampler.update(game_info=game_info, job_info=job_info) # update model sampler
+
+    def get_job_info(self, game_idx: int): return self._running_jobs.get(game_idx)
+
+
+@ray.remote
+class MultiRoleGameScheduler:
+    """Same surface as GameScheduler but builds teams from a FixedRoleTeamSampler.
+
+    Key differences vs GameScheduler:
+      - No random.shuffle of pids: pid IS the role identity, mapping is fixed.
+      - Every trainable pid carries its OWN current LoRA (per-role checkpoint).
+      - Both train and eval team composition delegate to the team sampler.
+      - _running_jobs records per-pid source ("checkpoint" | "openrouter") so the
+        collector can route trajectories to the correct per-pid buffer.
+    """
+
+    def __init__(self, team_sampler, env_sampler, logging_dir: str):
+        self.logger = setup_logger("multirole_game_scheduler", logging_dir)
+        self.team_sampler = team_sampler
+        self.env_sampler = env_sampler
+        self._game_idx = 0
+        self._running_jobs = {}
+
+    def next_train_job(self):
+        try:
+            env_spec = self.env_sampler.sample(kind="train")
+            agent_specs, models = self.team_sampler.sample_train_team(env_spec)
+            self._running_jobs[self._game_idx] = {"env_id": env_spec.env_id, "models": models, "kind": "train"}
+            game_spec = GameSpec(game_idx=self._game_idx, env_id=env_spec.env_id, seed=self._game_idx, agent_specs=agent_specs)
+            self._game_idx += 1
+            return game_spec
+        except Exception as exc:
+            self.logger.info(f"Exception in 'next_train_job': {exc}")
+            time.sleep(5)
+
+    def next_eval_job(self):
+        try:
+            env_spec = self.env_sampler.sample(kind="eval")
+            agent_specs, models = self.team_sampler.sample_eval_team(env_spec)
+            self._running_jobs[self._game_idx] = {"env_id": env_spec.env_id, "models": models, "kind": "eval"}
+            # eval_model_pid / eval_opponent_name: pick the first openrouter substitution if present, else first model
+            opp_entries = [m for m in models if m["source"] == "openrouter"]
+            ckpt_entries = [m for m in models if m["source"] == "checkpoint"]
+            eval_pid = ckpt_entries[0]["pid"] if ckpt_entries else None
+            eval_opp_name = opp_entries[0]["uid"].replace("fixed-", "") if opp_entries else None
+            game_spec = GameSpec(game_idx=self._game_idx, env_id=env_spec.env_id, seed=self._game_idx, agent_specs=agent_specs, eval_model_pid=eval_pid, eval_opponent_name=eval_opp_name)
+            self._game_idx += 1
+            return game_spec
+        except Exception as exc:
+            self.logger.info(f"Exception in 'next_eval_job': {exc}")
+            time.sleep(5)
+
+    def update(self, game_info: GameInformation):
+        job_info = self._running_jobs.pop(game_info.game_idx, None)
+        if job_info is None: return
+        actor_rs = [game_info.final_rewards[m["pid"]] for m in job_info["models"] if m["type"] == "model" if m["pid"] in game_info.final_rewards]
+        opp_rs = [game_info.final_rewards[m["pid"]] for m in job_info["models"] if m["type"] == "opponent" if m["pid"] in game_info.final_rewards]
+        self.env_sampler.update(avg_actor_reward=(sum(actor_rs) / len(actor_rs) if actor_rs else None), avg_opponent_reward=(sum(opp_rs) / len(opp_rs) if opp_rs else None))
+        self.team_sampler.update(game_info=game_info, job_info=job_info)
+
+    def get_job_info(self, game_idx: int): return self._running_jobs.get(game_idx)
 

@@ -33,7 +33,13 @@ def _scaled_hist(hist: deque[float|int], width: int) -> str:
 
 class TerminalInterface:
     def __init__(self, tracker, buffer):
-        self.tracker, self.buffer = tracker, buffer; self.console = Console(color_system="truecolor") 
+        # `buffer` is either a single ActorHandle (single-LoRA setup) or a dict {pid: ActorHandle} /
+        # list of ActorHandles (multirole setup). Normalize to a list for buffer-size aggregation,
+        # but keep `self.buffer` as the original for back-compat with any external accessors.
+        self.tracker, self.buffer = tracker, buffer; self.console = Console(color_system="truecolor")
+        if isinstance(buffer, dict):    self._buffers = list(buffer.values())
+        elif isinstance(buffer, list):  self._buffers = list(buffer)
+        else:                           self._buffers = [buffer]
         self._gpu_stats, self._general_stats, self._tracker_stats = None, None, None
         self._hist: dict[str, deque[float|int]] = collections.defaultdict(lambda: deque(maxlen=128))
         self._max_tok_s: int = 1_000; pynvml.nvmlInit(); self.pynvml=pynvml; self.gpu_count=pynvml.nvmlDeviceGetCount()
@@ -54,7 +60,11 @@ class TerminalInterface:
     async def _fetch_loop(self, interval: float = 2.0):
         while True:
             try:
-                self._gpu_stats=await self._system_stats(); self._buffer_size=await self.buffer.size.remote(); self._tracker_stats=await self.tracker.get_interface_info.remote() # Fetch all stats
+                self._gpu_stats=await self._system_stats()
+                # sum sizes across all buffers (one entry in single-LoRA mode, N in multirole)
+                sizes = await asyncio.gather(*(b.size.remote() for b in self._buffers))
+                self._buffer_size = sum(sizes)
+                self._tracker_stats=await self.tracker.get_interface_info.remote() # Fetch all stats
                 self._gpu_panel = self._gpu(); self._base_stats_panel = self._base_stats(); self._ts_panel = self._ts(); self._heatmap_panel = self._heatmap(); self._exploration_panel = self._exploration() # Update all panels with new data
             except Exception as e: self.console.log(f"[red]stat-fetch error: {e}")
             await asyncio.sleep(interval)
@@ -130,9 +140,42 @@ class TerminalInterface:
                 await asyncio.sleep(2)
 
 
+def _discover_buffers():
+    """Return either a single Buffer actor handle (single-LoRA setup) or a dict
+    {pid: handle} of per-role Buffer-role-{pid} actors (multirole setup).
+
+    Tries the single "Buffer" name first to preserve back-compat with example_standard.py.
+    Falls back to discovering Buffer-role-* via ray.util.list_named_actors.
+    """
+    try:
+        return ray.get_actor("Buffer")
+    except ValueError:
+        pass
+    try:
+        from ray.util import list_named_actors
+        named = list_named_actors(all_namespaces=False)
+        # entries may be strings ("Buffer-role-0") or dicts ({"name": ..., "namespace": ...})
+        names = [(e["name"] if isinstance(e, dict) else e) for e in named]
+    except Exception:
+        names = []
+    role_buffers = {}
+    for n in names:
+        m = re.match(r"^Buffer-role-(-?\d+)$", n)
+        if m:
+            try: role_buffers[int(m.group(1))] = ray.get_actor(n)
+            except Exception: continue
+    if not role_buffers:
+        raise RuntimeError(
+            "No buffer actors found. Expected either an actor named 'Buffer' "
+            "(single-LoRA) or one or more 'Buffer-role-<pid>' actors (multirole). "
+            "Make sure your training script is running and is in the 'unstable' namespace."
+        )
+    return role_buffers
+
+
 def main():
     ray.init(address="auto", namespace="unstable")   # connect to existing cluster
-    term = TerminalInterface(tracker=ray.get_actor("Tracker"), buffer=ray.get_actor("Buffer"))
+    term = TerminalInterface(tracker=ray.get_actor("Tracker"), buffer=_discover_buffers())
     asyncio.run(term.run())
 
 if __name__ == "__main__": main()

@@ -14,7 +14,9 @@ class ModelRegistry:
         self._db: dict[str, ModelMeta] = {}
         self._match_counts = defaultdict(int) # (uid_a, uid_b) -> n
         self._exploration = defaultdict(lambda: defaultdict(dict))
-        self._current_ckpt_uid : str | None = None 
+        # per-role current checkpoint uid. role_pid=-1 is the legacy single-LoRA slot
+        # so existing callers that don't pass a role_pid keep working unchanged.
+        self._current_ckpt_uid: Dict[int, str] = {}
         self._tracker = tracker; self._update_step: int = 1
         self.logger = setup_logger("model_registry", ray.get(self._tracker.get_log_dir.remote()))
 
@@ -27,16 +29,20 @@ class ModelRegistry:
             ranks[idx] = rank
         return ranks
 
-    def add_checkpoint(self, uid: str, path: str, iteration: int, inherit: bool=True):
-        self.logger.info(f"tryin to add ckpt: {uid}, path {path}, iteration {iteration}, inherit: {inherit}")
+    def add_checkpoint(self, uid: str, path: str, iteration: int, inherit: bool=True, role_pid: int = -1):
+        self.logger.info(f"tryin to add ckpt: {uid}, path {path}, iteration {iteration}, inherit: {inherit}, role_pid: {role_pid}")
         if uid in self._db: return
-        rating = self.TS.Rating(mu=self._db[self._current_ckpt_uid].rating.mu, sigma=self._db[self._current_ckpt_uid].rating.sigma*2) if (inherit and self._current_ckpt_uid in self._db) else self.TS.create_rating()
-        self._db[uid] = ModelMeta(uid=uid, kind="checkpoint", path_or_name=path, rating=rating, iteration=iteration)
-        self._current_ckpt_uid = uid # make it current
-        self.logger.info(f"added ckpt: {uid}, path {path}, iteration {iteration}, inherit: {inherit}")
+        prev_uid = self._current_ckpt_uid.get(role_pid)
+        rating = (self.TS.Rating(mu=self._db[prev_uid].rating.mu, sigma=self._db[prev_uid].rating.sigma*2)
+                  if (inherit and prev_uid in self._db) else self.TS.create_rating())
+        self._db[uid] = ModelMeta(uid=uid, kind="checkpoint", path_or_name=path, rating=rating, iteration=iteration, role_pid=(role_pid if role_pid >= 0 else None))
+        self._current_ckpt_uid[role_pid] = uid # make it current for this role
+        self.logger.info(f"added ckpt: {uid}, path {path}, iteration {iteration}, inherit: {inherit}, role_pid: {role_pid}")
 
     def get_all_models(self): return copy.deepcopy(self._db)
-    def get_current_ckpt(self) -> str|None: return self._current_ckpt_uid
+    def get_current_ckpt(self, role_pid: int = -1) -> str|None: return self._current_ckpt_uid.get(role_pid)
+    def get_current_ckpt_by_role(self, role_pid: int) -> str|None: return self._current_ckpt_uid.get(role_pid)
+    def get_current_ckpts_all_roles(self) -> Dict[int, str]: return dict(self._current_ckpt_uid)
     def get_name_or_lora_path(self, uid: str) -> str: return self._db[uid].path_or_name
     def add_fixed(self, name: str, prior_mu: float = 25.): 
         if f"fixed-{name}" not in self._db: self._db[f"fixed-{name}"] = ModelMeta(f"fixed-{name}", "fixed", name, self.TS.create_rating(mu=prior_mu))

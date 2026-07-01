@@ -1,9 +1,9 @@
 import time, ray, unstable
 import unstable.reward_transformations as retra
 
-MODEL_NAME = "Qwen/Qwen3-1.7B-Base"
-MAX_TRAIN_SEQ_LEN = None
-MAX_GENERATION_LENGTH = 4096 
+MODEL_NAME = "Qwen/Qwen3-4B"
+MAX_TRAIN_SEQ_LEN = 3000
+MAX_GENERATION_LENGTH = 1024 
 
 lora_config = {
     "lora_rank": 32, "lora_alpha": 32, "lora_dropout": 0.0,
@@ -21,11 +21,11 @@ ray.init(namespace="unstable")
 # initialize environment scheduler
 env_sampler = unstable.samplers.env_samplers.UniformRandomEnvSampler(
     train_env_specs=[
-        unstable.TrainEnvSpec(env_id="SimpleTak-v0-train", num_players=2, num_actors=2, prompt_template="qwen3-zs"), # if num_players == num_actors, it's mirror self-play and no opponents will be sampled
+        unstable.TrainEnvSpec(env_id="IteratedPrisonersDilemma-v0-train", num_players=2, num_actors=2, prompt_template="qwen3-zs"), # if num_players == num_actors, it's mirror self-play and no opponents will be sampled
     ],
     eval_env_specs=[
-        unstable.EvalEnvSpec(env_id="SimpleTak-v0-train", num_players=2, prompt_template="qwen3-zs"),
-        unstable.EvalEnvSpec(env_id="KuhnPoker-v0-train", num_players=2, prompt_template="qwen3-zs"),
+        unstable.EvalEnvSpec(env_id="IteratedPrisonersDilemma-v0-train", num_players=2, prompt_template="qwen3-zs", fixed_opponent="google/gemini-3.1-flash-lite-preview-20260303"),
+        unstable.EvalEnvSpec(env_id="PublicGoodsGame-v0-train", num_players=2, prompt_template="qwen3-zs", fixed_opponent="google/gemini-3.1-flash-lite-preview-20260303"),
 ])
 
 # Tracker
@@ -37,7 +37,7 @@ tracker = unstable.Tracker.options(name="Tracker").remote(
 # initialize model registry
 model_registry = unstable.ModelRegistry.options(name="ModelRegistry").remote(tracker=tracker)
 ray.get(model_registry.add_checkpoint.remote(uid="base", path=None, iteration=0))
-ray.get(model_registry.add_fixed.remote(name="google/gemini-2.0-flash-lite-001"))
+ray.get(model_registry.add_fixed.remote(name="google/gemini-3.1-flash-lite-preview-20260303"))
 
 # initialize model sampler
 model_sampler = unstable.samplers.model_samplers.BaseModelSampler(model_registry=model_registry) 
@@ -53,12 +53,7 @@ step_buffer = unstable.StepBuffer.options(name="Buffer").remote(
     sampling_reward_transformation=retra.ComposeSamplingRewardTransforms([retra.NormalizeRewardsByEnv(True)]),
 )
 
-# initialize the collector
-collector = unstable.Collector.options(name="Collector").remote(
-    vllm_config=vllm_config, tracker=tracker, buffer=step_buffer, game_scheduler=game_scheduler,
-)
-
-# initialize the learner
+# initialize the learner first so it reserves its GPU before the collector claims the rest for VLLM actors
 learner = unstable.REINFORCELearner.options(num_gpus=1, name="Learner").remote(
     model_name=MODEL_NAME,
     lora_cfg=lora_config,
@@ -75,10 +70,16 @@ learner = unstable.REINFORCELearner.options(num_gpus=1, name="Learner").remote(
 )
 ray.get(learner.initialize_algorithm.remote(max_train_len=MAX_TRAIN_SEQ_LEN, max_generation_len=MAX_GENERATION_LENGTH))
 
+# initialize the collector with 2 VLLM actors (1 learner GPU + 2 collector GPUs = 3 total)
+collector = unstable.Collector.options(name="Collector").remote(
+    vllm_config=vllm_config, tracker=tracker, buffer=step_buffer, game_scheduler=game_scheduler,
+    num_actors=2,
+)
+
 
 try:
-    collector.collect.remote(num_train_workers=384, num_eval_workers=16)
-    ray.get(learner.train.remote(200))
+    collector.collect.remote(num_train_workers=128, num_eval_workers=8)
+    ray.get(learner.train.remote(100))
 finally:
     ray.kill(collector, no_restart=True)
     ray.shutdown()

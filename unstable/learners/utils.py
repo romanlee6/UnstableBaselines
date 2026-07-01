@@ -59,6 +59,48 @@ def build_peft_model(base_name: str, device: torch.device, lora_cfg: Dict[str, A
     tok.pad_token = tok.eos_token
     return model, tok
 
+
+def _lora_config_from(lora_cfg: Dict[str, Any], task_type: str) -> LoraConfig:
+    return LoraConfig(
+        r=lora_cfg.get("lora_rank", 32), lora_alpha=lora_cfg.get("lora_alpha", 32), lora_dropout=lora_cfg.get("lora_dropout", 0.05),
+        bias="none", task_type=task_type, target_modules=lora_cfg.get("target_modules", ["q_proj", "k_proj", "v_proj", "o_proj"]),
+    )
+
+
+def role_adapter_name(role_pid: int) -> str:
+    # NOTE: keep this format stable - the multi-role learner filters optimizer params with f".{role_adapter_name(pid)}."
+    # so a non-dotted substring like "role-1" inside "role-10" would collide. The dotted form in the caller avoids that.
+    return f"role-{role_pid}"
+
+
+def build_multi_adapter_peft_model(base_name: str, device: torch.device, role_lora_cfgs: Dict[int, Dict[str, Any]], initial_lora_paths: Optional[Dict[int, str]] = None, freeze_base: bool=True) -> Tuple[torch.nn.Module, "transformers.PreTrainedTokenizer", list]:
+    """Load one base model and N PEFT LoRA adapters on top, one per role/pid.
+
+    The first role is attached via get_peft_model() (which turns the base into a PeftModel).
+    Remaining roles are attached via model.add_adapter() on the PeftModel - this is the PEFT
+    API path, not the HF Transformers built-in PEFT, so set_adapter() correctly flips
+    requires_grad per adapter.
+    """
+    assert len(role_lora_cfgs) >= 1, "need at least one role"
+    base = _load_base(base_name, torch.bfloat16, device)
+    if freeze_base: _freeze(base, None)
+
+    role_pids = sorted(role_lora_cfgs.keys())
+    first_pid = role_pids[0]
+    first_name = role_adapter_name(first_pid)
+    model = get_peft_model(base, _lora_config_from(role_lora_cfgs[first_pid], "CAUSAL_LM"), adapter_name=first_name).to(device)
+
+    for pid in role_pids[1:]:
+        model.add_adapter(role_adapter_name(pid), _lora_config_from(role_lora_cfgs[pid], "CAUSAL_LM"))
+
+    if initial_lora_paths:
+        for pid, path in initial_lora_paths.items():
+            if path: model.load_adapter(path, adapter_name=role_adapter_name(pid), is_trainable=True)
+
+    tok = AutoTokenizer.from_pretrained(base_name, trust_remote_code=True)
+    tok.pad_token = tok.eos_token
+    return model, tok, role_pids
+
 def _json_safe(obj):
     if isinstance(obj, set): return list(obj) # turn sets into lists
     raise TypeError # let json handle the rest

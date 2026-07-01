@@ -1,4 +1,4 @@
-import re, random, logging, itertools
+import os, re, random, logging, itertools
 from pathlib import Path
 from dataclasses import asdict, dataclass, field
 from typing import Any, Callable, Dict, List, Tuple, Protocol, Optional
@@ -8,6 +8,11 @@ from ray.exceptions import RayActorError, RayTaskError
 
 import textarena as ta
 assert ta.__version__ >= "0.6.16", f"TextArena package version is too old: {ta.__version__}. Required version is at least 0.6.16."
+
+# env state.error_allowance is hardcoded to 0 by default below; override via the
+# UB_ERROR_ALLOWANCE env var. Ray remote workers inherit os.environ from the driver
+# at task submission, so setting this in the driver before ray.init is enough.
+_ERROR_ALLOWANCE = int(os.environ.get("UB_ERROR_ALLOWANCE", "0"))
 
 # local imports
 from unstable.actor import VLLMActor
@@ -39,7 +44,7 @@ def run_game(game_spec: GameSpec, actor: VLLMActor):
         "name": agent_spec.lora_path if agent_spec.lora_path else agent_spec.openrouter_name,
         "model": CallableActorWrapper(actor=actor, lora_path=agent_spec.lora_path, obs_fmt_fn=OBSERVATION_FORMATTING[agent_spec.prompt_template], extract_fn=ACTION_EXTRACTION[agent_spec.action_extraction_fn]) if agent_spec.openrouter_name==None else ta.agents.OpenRouterAgent(agent_spec.openrouter_name)
     } for agent_spec in game_spec.agent_specs} # build agents
-    env=ta.make(game_spec.env_id); env.reset(num_players=len(agents), seed=game_spec.seed); env.state.error_allowance=0; turn=0
+    env=ta.make(game_spec.env_id); env.reset(num_players=len(agents), seed=game_spec.seed); env.state.error_allowance=_ERROR_ALLOWANCE; turn=0
     while True:
         pid, obs = env.get_observation()
         # get model (or opponent) action
@@ -64,17 +69,28 @@ def run_game(game_spec: GameSpec, actor: VLLMActor):
 
 @ray.remote
 class Collector:
-    def __init__(self, vllm_config, tracker, buffer, game_scheduler):
+    def __init__(self, vllm_config, tracker, buffer, game_scheduler, num_actors: Optional[int]=None, buffers: Optional[Dict[int, Any]]=None):
         self.logger = setup_logger("collector", ray.get(tracker.get_log_dir.remote()))
         self.tracker, self.buffer, self.game_scheduler = tracker, buffer, game_scheduler
-        # self.actors = [VLLMActor.options(num_gpus=1).remote(cfg=vllm_config, tracker=tracker, name=f"Actor-{i}") for i in range(int(ray.available_resources().get("GPU", 0))-1)]
-        self.actors = [VLLMActor.options(num_gpus=1).remote(cfg=vllm_config, tracker=tracker, name=f"Actor-{i}") for i in range(int(ray.available_resources().get("GPU", 0)))]
+        # multi-role mode: dict of per-pid buffer Ray actor handles. When set, _post_train
+        # routes each trajectory to buffers[traj.pid] instead of self.buffer.
+        self.buffers: Optional[Dict[int, Any]] = buffers
+        available_gpus = int(ray.available_resources().get("GPU", 0))
+        actor_count = available_gpus if num_actors is None else num_actors
+        if actor_count < 1:
+            raise RuntimeError(
+                "Collector could not start any VLLM actors. "
+                f"Ray reports {available_gpus} available GPU(s) inside the collector. "
+                "Reserve the learner's GPU before constructing the Collector, "
+                "or pass an explicit num_actors."
+            )
+        self.actors = [VLLMActor.options(num_gpus=1).remote(cfg=vllm_config, tracker=tracker, name=f"Actor-{i}") for i in range(actor_count)]
         self._actor_iter = itertools.cycle(self.actors)
 
         # thead keeping
         self.flight: Dict[ray.ObjectRef, TaskMeta] = {}
         self._num_running = lambda typ: sum(meta.type == typ for meta in self.flight.values())
-        self.logger.info("Collector initialized")
+        self.logger.info(f"Collector initialized with {actor_count} VLLM actor(s)")
     
     def _launch_jobs(self, max_train: int, max_eval: Optional[int]):
         while self._num_running("train") < max_train: # submit new train game
@@ -104,15 +120,31 @@ class Collector:
         self._post_train(meta, game_information, player_trajs) if meta.type=="train" else self._post_eval(meta, game_information)
     
     def _post_train(self, meta: TaskMeta, game_information: GameInformation, player_trajs: List[PlayerTrajectory]):
-        for traj in player_trajs: self.buffer.add_player_trajectory.remote(traj, env_id=meta.env_id); self.tracker.add_player_trajectory.remote(traj, env_id=meta.env_id)
+        for traj in player_trajs:
+            if self.buffers is not None:
+                # multi-role: route trajectory to its role's buffer keyed by pid
+                buf = self.buffers.get(traj.pid)
+                if buf is None:
+                    self.logger.info(f"no buffer for pid={traj.pid}, dropping trajectory")
+                    continue
+                buf.add_player_trajectory.remote(traj, env_id=meta.env_id)
+            else:
+                self.buffer.add_player_trajectory.remote(traj, env_id=meta.env_id)
+            self.tracker.add_player_trajectory.remote(traj, env_id=meta.env_id)
         self.game_scheduler.update.remote(game_info=game_information)
 
     def _post_eval(self, meta: TaskMeta, game_information: GameInformation):
         self.tracker.add_eval_game_information.remote(game_information=game_information, env_id=meta.env_id)
     
+    def _any_buffer_collecting(self) -> bool:
+        if self.buffers is not None:
+            flags = ray.get([b.continue_collection.remote() for b in self.buffers.values()])
+            return any(flags)
+        return ray.get(self.buffer.continue_collection.remote())
+
     def collect(self, num_train_workers: int, num_eval_workers: Optional[int]=None):
         self.logger.info("entered collect func")
-        while ray.get(self.buffer.continue_collection.remote()):
+        while self._any_buffer_collecting():
             self.logger.info("entered colelct loop")
             self._launch_jobs(num_train_workers, num_eval_workers)
             if not self.flight: continue

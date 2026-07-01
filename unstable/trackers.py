@@ -93,7 +93,9 @@ class Tracker(BaseTracker):
 
     def log_inference(self, actor: str, gpu_ids: list[int], stats: dict[str, float]):
         for key in stats: self._put(f"inference/{actor}/{key}", stats[key])
-        for gpu_id in gpu_ids: self._interface_stats["gpu_tok_s"][gpu_id] = stats["tok_s"]
+        # ray.get_gpu_ids() returns strings (e.g. ['1']) but the terminal reads
+        # gpu_d['id'] as int from pynvml - coerce so the dict lookup matches.
+        for gpu_id in gpu_ids: self._interface_stats["gpu_tok_s"][int(gpu_id)] = stats["tok_s"]
         self._buffer.update(self._agg('inference'))
     
     def log_learner(self, info: dict):

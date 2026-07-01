@@ -95,5 +95,24 @@ class ModelMeta:
     draws: int = 0
     active: bool = True
     iteration: int|None = None
+    role_pid: int|None = None # which role/pid this checkpoint belongs to (None = single-LoRA legacy)
+
+
+@dataclass
+class RoleSpec:
+    pid: int
+    lora_cfg: Dict = field(default_factory=dict) # peft.LoraConfig kwargs (r, lora_alpha, target_modules, ...)
+    initial_lora_path: str|None = None # optional warm-start adapter dir
+
+@dataclass
+class TeamSpec:
+    roles: List[RoleSpec]
+    num_players: int
+
+    def pids(self) -> List[int]: return [r.pid for r in self.roles]
+    def role_by_pid(self, pid: int) -> "RoleSpec":
+        for r in self.roles:
+            if r.pid == pid: return r
+        raise KeyError(f"no role for pid={pid}")
 
 

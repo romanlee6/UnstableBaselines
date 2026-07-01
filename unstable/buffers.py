@@ -22,11 +22,12 @@ class BaseBuffer:
 @ray.remote
 class StepBuffer(BaseBuffer):
     def __init__(
-        self, max_buffer_size: int, tracker: BaseTracker, 
-        final_reward_transformation: Optional[ComposeFinalRewardTransforms], 
-        step_reward_transformation: Optional[ComposeStepRewardTransforms], 
-        sampling_reward_transformation: Optional[ComposeSamplingRewardTransforms], 
-        buffer_strategy: str = "random"
+        self, max_buffer_size: int, tracker: BaseTracker,
+        final_reward_transformation: Optional[ComposeFinalRewardTransforms],
+        step_reward_transformation: Optional[ComposeStepRewardTransforms],
+        sampling_reward_transformation: Optional[ComposeSamplingRewardTransforms],
+        buffer_strategy: str = "random",
+        role_pid: Optional[int] = None,
     ):
         self.max_buffer_size, self.buffer_strategy = max_buffer_size, buffer_strategy
         self.final_reward_transformation = final_reward_transformation
@@ -36,6 +37,7 @@ class StepBuffer(BaseBuffer):
         self.steps: List[Step] = []
         self.training_steps = 0
         self.tracker = tracker
+        self.role_pid = role_pid
         self.local_storage_dir = ray.get(self.tracker.get_train_dir.remote())
         self.logger = setup_logger("step_buffer", ray.get(tracker.get_log_dir.remote())) # setup logging
         self.mutex = Lock()
@@ -63,7 +65,8 @@ class StepBuffer(BaseBuffer):
             for b in batch: self.steps.remove(b)
         batch = self.sampling_reward_transformation(batch) if self.sampling_reward_transformation is not None else batch
         self.logger.info(f"Sampling {len(batch)} samples from buffer.")
-        try: write_training_data_to_file(batch=batch, filename=os.path.join(self.local_storage_dir, f"train_data_step_{self.training_steps}.csv"))
+        suffix = f"_role_{self.role_pid}" if self.role_pid is not None else ""
+        try: write_training_data_to_file(batch=batch, filename=os.path.join(self.local_storage_dir, f"train_data_step_{self.training_steps}{suffix}.csv"))
         except Exception as exc: self.logger.error(f"Exception when trying to write training data to file: {exc}")
         self.training_steps += 1
         return batch

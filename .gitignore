@@ -191,3 +191,9 @@ sandbox.rst
 _local/*
 
 count_lines.py
+
+# training/experiment artifacts
+test_logs/
+orcd_backup/
+*.err
+*.out
