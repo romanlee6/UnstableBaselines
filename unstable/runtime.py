@@ -78,6 +78,7 @@ def build_multirole(*, model_name: str, role_pids: Sequence[int], train_envs: Se
                     eval_substitutions: Optional[dict]=None,
                     env_sampling_strategy: str = "random",
                     role_lora_cfgs: Optional[dict]=None,
+                    shuffle_roles: bool = True,
                     algorithm: str = "reinforce",
                     adv_estimator: Optional[str]=None,
                     use_turn_scores: bool = True,
@@ -92,6 +93,7 @@ def build_multirole(*, model_name: str, role_pids: Sequence[int], train_envs: Se
                     gradient_clipping: float=0.2, activation_checkpointing: bool=True,
                     gradient_checkpointing: bool=True, use_trainer_cache: bool=False,
                     buffer_size: Optional[int]=None, vllm_config: Optional[dict]=None,
+                    initial_lora_paths: Optional[dict]=None,
                     wandb_project: str="UnstableBaselines"):
     """Multi-role variant of build().
 
@@ -126,6 +128,7 @@ def build_multirole(*, model_name: str, role_pids: Sequence[int], train_envs: Se
     # eval substitutions register their OpenRouter names as fixed entries (so update_ratings works)
     team_sampler = unstable.samplers.FixedRoleTeamSampler(
         model_registry=model_registry, role_pids=role_pids, eval_substitutions=eval_substitutions or {},
+        shuffle_roles=shuffle_roles,
     )
 
     game_scheduler = unstable.game_scheduler.MultiRoleGameScheduler.options(name="GameScheduler").remote(
@@ -165,7 +168,7 @@ def build_multirole(*, model_name: str, role_pids: Sequence[int], train_envs: Se
         mini_batch_size=mini_batch_size, learning_rate=learning_rate, grad_clip=gradient_clipping,
         buffers=buffers, tracker=tracker, model_registry=model_registry,
         activation_checkpointing=activation_checkpointing, gradient_checkpointing=gradient_checkpointing,
-        use_trainer_cache=use_trainer_cache,
+        use_trainer_cache=use_trainer_cache, initial_lora_paths=initial_lora_paths,
     )
 
     match algorithm:

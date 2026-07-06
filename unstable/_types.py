@@ -23,6 +23,7 @@ class PlayerTrajectory:
     step_infos:         List[Dict] = field(default_factory=list)
     game_info:          Dict = field(default_factory=dict)
     num_turns:          int = field(default_factory=int)
+    role_pid:           Optional[int] = None
 
 
 @dataclass
@@ -40,7 +41,7 @@ class GameInformation:
     eval_model_pid:     Optional[int] = None
     eval_opponent_name: Optional[str] = None
 
-@dataclass 
+@dataclass
 class AgentSpec:
     pid: int
     kind: str # "checkpoint" | "openrouter"
@@ -49,6 +50,7 @@ class AgentSpec:
     lora_path: str|None = None
     prompt_template: str = "default" # prompt template key
     action_extraction_fn: str = "default"
+    role_pid: int|None = None # multi-role: identifies which role's LoRA/buffer this seat belongs to; may differ from env pid when the sampler shuffles seat↔role.
 
 @dataclass
 class GameSpec:

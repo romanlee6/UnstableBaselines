@@ -40,7 +40,7 @@ class CallableActorWrapper:
 def run_game(game_spec: GameSpec, actor: VLLMActor):
     game_information = GameInformation(game_idx=game_spec.game_idx, eval_model_pid=game_spec.eval_model_pid, eval_opponent_name=game_spec.eval_opponent_name)
     agents = {agent_spec.pid: {
-        "traj": PlayerTrajectory(pid=agent_spec.pid) if agent_spec.collect_data else None, 
+        "traj": PlayerTrajectory(pid=agent_spec.pid, role_pid=agent_spec.role_pid) if agent_spec.collect_data else None,
         "name": agent_spec.lora_path if agent_spec.lora_path else agent_spec.openrouter_name,
         "model": CallableActorWrapper(actor=actor, lora_path=agent_spec.lora_path, obs_fmt_fn=OBSERVATION_FORMATTING[agent_spec.prompt_template], extract_fn=ACTION_EXTRACTION[agent_spec.action_extraction_fn]) if agent_spec.openrouter_name==None else ta.agents.OpenRouterAgent(agent_spec.openrouter_name)
     } for agent_spec in game_spec.agent_specs} # build agents
@@ -122,10 +122,13 @@ class Collector:
     def _post_train(self, meta: TaskMeta, game_information: GameInformation, player_trajs: List[PlayerTrajectory]):
         for traj in player_trajs:
             if self.buffers is not None:
-                # multi-role: route trajectory to its role's buffer keyed by pid
-                buf = self.buffers.get(traj.pid)
+                # multi-role: route trajectory to its role's buffer.
+                # Prefer role_pid (decoupled from env pid when the sampler shuffles seats)
+                # and fall back to env pid for legacy fixed-mapping callers.
+                route_pid = traj.role_pid if traj.role_pid is not None else traj.pid
+                buf = self.buffers.get(route_pid)
                 if buf is None:
-                    self.logger.info(f"no buffer for pid={traj.pid}, dropping trajectory")
+                    self.logger.info(f"no buffer for role_pid={route_pid} (env pid={traj.pid}), dropping trajectory")
                     continue
                 buf.add_player_trajectory.remote(traj, env_id=meta.env_id)
             else:

@@ -1,3 +1,4 @@
+import random
 import ray
 from typing import Dict, Any, List, Optional
 
@@ -5,19 +6,34 @@ from unstable._types import AgentSpec, GameInformation
 
 
 class FixedRoleTeamSampler:
-    """Assembles a team where each pid is bound to a specific role.
+    """Assembles a team of role-LoRAs across env seats.
 
-    Asymmetric: role <-> pid mapping is fixed (no shuffle).
+    Set `shuffle_roles=True` (default) to randomize which role's LoRA plays which
+    env pid per training episode. This is the mitigation for env-level positional
+    asymmetry (e.g. IPD's leaky conversation phase where pid=1 reads pid=0's
+    message before responding): with shuffle, each role's data-collection is
+    averaged over both seats, so LoRAs do not bake in a positional advantage.
 
-    Train: every pid uses its own current role-LoRA checkpoint; all pids collect data.
+    Buffer routing is by role_pid (not env pid), so shuffling seats does not
+    misroute trajectories.
+
+    Train: every seat runs a role-LoRA checkpoint; all trajectories are collected.
     Eval:  configurable per pid - either the trained LoRA or an OpenRouter substitute
-           via `eval_substitutions = {pid: openrouter_name}`.
+           via `eval_substitutions = {pid: openrouter_name}`. Eval never shuffles
+           (fixed_opponent semantics require deterministic seat assignment).
     """
 
-    def __init__(self, model_registry, role_pids: List[int], eval_substitutions: Optional[Dict[int, str]] = None):
+    def __init__(
+        self,
+        model_registry,
+        role_pids: List[int],
+        eval_substitutions: Optional[Dict[int, str]] = None,
+        shuffle_roles: bool = True,
+    ):
         self.model_registry = model_registry
         self.role_pids = list(role_pids)
         self.eval_substitutions = dict(eval_substitutions or {})
+        self.shuffle_roles = shuffle_roles
 
         # ensure each OpenRouter substitute exists as a fixed entry so rating updates work
         for _, openrouter_name in self.eval_substitutions.items():
@@ -30,15 +46,23 @@ class FixedRoleTeamSampler:
         return uid, path
 
     def sample_train_team(self, env_spec):
+        assert env_spec.num_players == len(self.role_pids), (
+            f"FixedRoleTeamSampler expects num_players ({env_spec.num_players}) "
+            f"== len(role_pids) ({len(self.role_pids)}) so every seat gets one role."
+        )
+        seat_to_role = list(self.role_pids)
+        if self.shuffle_roles:
+            random.shuffle(seat_to_role)
+
         agent_specs, models = [], []
-        for pid in range(env_spec.num_players):
-            assert pid in self.role_pids, f"pid {pid} not assigned to any role (declared roles: {self.role_pids})"
-            uid, lora_path = self._ckpt_for_role(pid)
+        for seat_pid, role_pid in enumerate(seat_to_role):
+            uid, lora_path = self._ckpt_for_role(role_pid)
             agent_specs.append(AgentSpec(
-                pid=pid, kind="checkpoint", collect_data=True, lora_path=lora_path,
+                pid=seat_pid, kind="checkpoint", collect_data=True, lora_path=lora_path,
                 prompt_template=env_spec.prompt_template, action_extraction_fn=env_spec.action_extraction_fn,
+                role_pid=role_pid,
             ))
-            models.append({"uid": uid, "pid": pid, "type": "model", "role_pid": pid, "source": "checkpoint"})
+            models.append({"uid": uid, "pid": seat_pid, "type": "model", "role_pid": role_pid, "source": "checkpoint"})
         return agent_specs, models
 
     def sample_eval_team(self, env_spec):
