@@ -1,16 +1,20 @@
 import trueskill
 from dataclasses import dataclass, field
-from typing import List, Any, Dict, Optional
+from typing import List, Any, Dict, Optional, Tuple
 
 
 @dataclass
 class Step:
     pid: int
-    obs: str 
+    obs: str
     act: str
     reward: float
     env_id: str
     step_info: Optional[Dict]
+    game_idx: int = -1
+    role_pid: Optional[int] = None
+    own_model_uid: Optional[str] = None
+    opponent_model_uids: Tuple[str, ...] = ()
 
 @dataclass
 class PlayerTrajectory:
@@ -21,9 +25,13 @@ class PlayerTrajectory:
     extracted_actions:  List[str] = field(default_factory=list)
     format_feedbacks:   List[Dict] = field(default_factory=list)
     step_infos:         List[Dict] = field(default_factory=list)
+    step_rewards:       List[float] = field(default_factory=list)
     game_info:          Dict = field(default_factory=dict)
     num_turns:          int = field(default_factory=int)
     role_pid:           Optional[int] = None
+    game_idx:           int = -1
+    own_model_uid:      Optional[str] = None
+    opponent_model_uids: Tuple[str, ...] = ()
 
 
 @dataclass
@@ -51,6 +59,7 @@ class AgentSpec:
     prompt_template: str = "default" # prompt template key
     action_extraction_fn: str = "default"
     role_pid: int|None = None # multi-role: identifies which role's LoRA/buffer this seat belongs to; may differ from env pid when the sampler shuffles seat↔role.
+    model_uid: str|None = None # checkpoint uid or "fixed-<name>" for this seat; carried onto PlayerTrajectory/Step so learners can group by (env, role, own_ckpt, opp_ckpts).
 
 @dataclass
 class GameSpec:

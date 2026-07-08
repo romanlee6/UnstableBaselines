@@ -39,8 +39,13 @@ class CallableActorWrapper:
 @ray.remote(num_cpus=0)
 def run_game(game_spec: GameSpec, actor: VLLMActor):
     game_information = GameInformation(game_idx=game_spec.game_idx, eval_model_pid=game_spec.eval_model_pid, eval_opponent_name=game_spec.eval_opponent_name)
+    uid_by_pid: Dict[int, Optional[str]] = {a.pid: a.model_uid for a in game_spec.agent_specs}
     agents = {agent_spec.pid: {
-        "traj": PlayerTrajectory(pid=agent_spec.pid, role_pid=agent_spec.role_pid) if agent_spec.collect_data else None,
+        "traj": PlayerTrajectory(
+            pid=agent_spec.pid, role_pid=agent_spec.role_pid,
+            game_idx=game_spec.game_idx, own_model_uid=agent_spec.model_uid,
+            opponent_model_uids=tuple(sorted(u for p, u in uid_by_pid.items() if p != agent_spec.pid and u is not None)),
+        ) if agent_spec.collect_data else None,
         "name": agent_spec.lora_path if agent_spec.lora_path else agent_spec.openrouter_name,
         "model": CallableActorWrapper(actor=actor, lora_path=agent_spec.lora_path, obs_fmt_fn=OBSERVATION_FORMATTING[agent_spec.prompt_template], extract_fn=ACTION_EXTRACTION[agent_spec.action_extraction_fn]) if agent_spec.openrouter_name==None else ta.agents.OpenRouterAgent(agent_spec.openrouter_name)
     } for agent_spec in game_spec.agent_specs} # build agents
@@ -58,6 +63,16 @@ def run_game(game_spec: GameSpec, actor: VLLMActor):
         if agents[pid]["traj"] != None:
             agents[pid]["traj"].obs.append(obs); agents[pid]["traj"].actions.append(raw); agents[pid]["traj"].extracted_actions.append(extracted)
             format_feedback["invalid_move"] = False; agents[pid]["traj"].format_feedbacks.append(format_feedback); agents[pid]["traj"].step_infos.append(step_info)
+            agents[pid]["traj"].step_rewards.append(0.0)
+        # distribute per-step env rewards keyed by pid (contract: env writes
+        # state.step_info["step_rewards_by_pid"] = {pid: float, ...}); missing/empty = no-op.
+        # rewards land on each pid's most-recent trajectory step, which handles both
+        # single-actor-per-step and retroactive (resolve-after-all-acted) attribution.
+        srp = (step_info or {}).get("step_rewards_by_pid") or {}
+        for tgt_pid, r in srp.items():
+            t = agents.get(tgt_pid, {}).get("traj")
+            if t is not None and t.step_rewards:
+                t.step_rewards[-1] += float(r)
         if done: break
     final_rewards, game_info = env.close()
     for pid in agents.keys():

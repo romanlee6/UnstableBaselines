@@ -46,8 +46,14 @@ class StepBuffer(BaseBuffer):
         reward = self.final_reward_transformation(reward=player_traj.final_reward, pid=player_traj.pid, env_id=env_id) if self.final_reward_transformation else player_traj.final_reward
         for idx in range(len(player_traj.obs)):
             step_reward = self.step_reward_transformation(player_traj=player_traj, step_index=idx, reward=reward) if self.step_reward_transformation else reward
-            with self.mutex: 
-                self.steps.append(Step(pid=player_traj.pid, obs=player_traj.obs[idx], act=player_traj.actions[idx], reward=step_reward, env_id=env_id, step_info={"raw_reward": player_traj.final_reward, "env_reward": reward, "step_reward": step_reward}))
+            with self.mutex:
+                self.steps.append(Step(
+                    pid=player_traj.pid, obs=player_traj.obs[idx], act=player_traj.actions[idx],
+                    reward=step_reward, env_id=env_id,
+                    step_info={"raw_reward": player_traj.final_reward, "env_reward": reward, "step_reward": step_reward},
+                    game_idx=player_traj.game_idx, role_pid=player_traj.role_pid,
+                    own_model_uid=player_traj.own_model_uid, opponent_model_uids=player_traj.opponent_model_uids,
+                ))
         self.logger.info(f"Buffer size: {len(self.steps)}, added {len(player_traj.obs)} steps")
         # downsample if necessary
         excess_num_samples = max(0, len(self.steps) - self.max_buffer_size); self.logger.info(f"Excess Num Samples: {excess_num_samples}")
@@ -105,7 +111,13 @@ class EpisodeBuffer(BaseBuffer):
         reward = self.final_reward_transformation(reward=player_traj.final_reward, pid=player_traj.pid, env_id=env_id) if self.final_reward_transformation else player_traj.final_reward
         for idx in range(len(player_traj.obs)):
             step_reward = self.step_reward_transformation(player_traj=player_traj, step_index=idx, reward=reward) if self.step_reward_transformation else reward
-            episode.append(Step(pid=player_traj.pid, obs=player_traj.obs[idx], act=player_traj.actions[idx], reward=step_reward, env_id=env_id, step_info={"raw_reward": player_traj.final_reward, "env_reward": reward, "step_reward": step_reward}))
+            episode.append(Step(
+                pid=player_traj.pid, obs=player_traj.obs[idx], act=player_traj.actions[idx],
+                reward=step_reward, env_id=env_id,
+                step_info={"raw_reward": player_traj.final_reward, "env_reward": reward, "step_reward": step_reward},
+                game_idx=player_traj.game_idx, role_pid=player_traj.role_pid,
+                own_model_uid=player_traj.own_model_uid, opponent_model_uids=player_traj.opponent_model_uids,
+            ))
         with self.mutex:
             self.episodes.append(episode)
             excess_num_samples = max(0, len(tree.flatten(self.episodes)) - self.max_buffer_size)

@@ -30,11 +30,16 @@ class BaseTracker:
 @ray.remote
 class Tracker(BaseTracker): 
     FLUSH_EVERY = 64
-    def __init__(self, run_name: str, wandb_project: Optional[str]=None):
+    def __init__(self, run_name: str, wandb_project: Optional[str]=None,
+                 wandb_id: Optional[str]=None, wandb_resume: Optional[str]=None):
         super().__init__(run_name=run_name)
         self.logger = setup_logger("tracker", self.get_log_dir())
         self.use_wandb = False
-        if wandb_project: wandb.init(project=wandb_project, name=run_name); self.use_wandb = True; wandb.define_metric("*", step_metric="learner/step")
+        if wandb_project:
+            wandb_kwargs = {"project": wandb_project, "name": run_name}
+            if wandb_id: wandb_kwargs["id"] = wandb_id
+            if wandb_resume: wandb_kwargs["resume"] = wandb_resume
+            wandb.init(**wandb_kwargs); self.use_wandb = True; wandb.define_metric("*", step_metric="learner/step")
         self._m: Dict[str, collections.deque] = collections.defaultdict(lambda: collections.deque(maxlen=512))
         self._buffer: Dict[str, Scalar] = {}
         self._n = {}

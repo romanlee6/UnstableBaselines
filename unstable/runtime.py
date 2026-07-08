@@ -17,7 +17,7 @@ _MULTIROLE_ALGOS = {
     "ppo":       unstable.MultiRolePPOLearner,   # adv_estimator='gae'
     "grpo":      unstable.MultiRolePPOLearner,   # adv_estimator='grpo'
 }
-_MULTIROLE_EPISODE_ALGOS = {"a2c", "ppo"}   # GAE -> per-role EpisodeBuffer
+_MULTIROLE_EPISODE_ALGOS = {"a2c", "ppo", "grpo"}   # GAE / turn-level return-to-go -> per-role EpisodeBuffer
 def _default_vllm_cfg(model_name: str, lora_cfg: dict, max_generation_len: int) -> dict: return {"model_name": model_name, "temperature": 0.6, "max_tokens": max_generation_len, "max_parallel_seq": 128, "max_loras": 8, "lora_config": lora_cfg, "max_model_len": 8192}
 
 class _UBRun:
@@ -29,7 +29,7 @@ class _UBRun:
         finally:
             ray.kill(self.collector, no_restart=True); ray.shutdown()
 
-def build(*, model_name: str, train_envs: Sequence[unstable.TrainEnvSpec], eval_envs: Optional[Sequence[unstable.EvalEnvSpec]]=None, env_sampling_strategy: str = "random", opponent_sampling_strategy: str = "none", fixed_opponents: Sequence[str] = ["google/gemini-2.0-flash-lite-001"], algorithm: str = "reinforce", max_train_len: Optional[int]=None, max_generation_len: int=4096, batch_size: int=384, mini_batch_size: int=1, learning_rate: float=1e-5, gradient_clipping: float=0.2, activation_checkpointing: bool=True, gradient_checkpointing: bool=True, use_trainer_cache: bool = False, buffer_size: Optional[int]=None, lora_config: Optional[dict]=None, vllm_config: Optional[dict]=None, wandb_project: str="UnstableBaselines"):
+def build(*, model_name: str, train_envs: Sequence[unstable.TrainEnvSpec], eval_envs: Optional[Sequence[unstable.EvalEnvSpec]]=None, env_sampling_strategy: str = "random", opponent_sampling_strategy: str = "none", fixed_opponents: Sequence[str] = ["google/gemini-2.0-flash-lite-001"], algorithm: str = "reinforce", max_train_len: Optional[int]=None, max_generation_len: int=4096, batch_size: int=384, mini_batch_size: int=1, learning_rate: float=1e-5, gradient_clipping: float=0.2, activation_checkpointing: bool=True, gradient_checkpointing: bool=True, use_trainer_cache: bool = False, buffer_size: Optional[int]=None, lora_config: Optional[dict]=None, vllm_config: Optional[dict]=None, wandb_project: str="UnstableBaselines", env_step_reward_scale: float=1.0):
     # Ray init
     ray.init(namespace="unstable")  
     
@@ -54,8 +54,9 @@ def build(*, model_name: str, train_envs: Sequence[unstable.TrainEnvSpec], eval_
 
     # build buffer TODO maybe move the reward transformations outside
     buffer_size = buffer_size or batch_size*2
-    if algorithm in _STEP_BUFFER_ALGOS: buffer = unstable.StepBuffer.options(name="Buffer").remote(max_buffer_size=buffer_size, tracker=tracker, final_reward_transformation=retra.ComposeFinalRewardTransforms([retra.RoleAdvantageByEnvFormatter()]), step_reward_transformation=retra.ComposeStepRewardTransforms([retra.RewardForFormat(1.5), retra.PenaltyForInvalidMove(1.0, -1.0)]), sampling_reward_transformation=retra.ComposeSamplingRewardTransforms([retra.NormalizeRewardsByEnv(True)]))
-    elif algorithm in _EPISODE_BUFFER_ALGOS: buffer = unstable.EpisodeBuffer.options(name="Buffer").remote(max_buffer_size=buffer_size, tracker=tracker, final_reward_transformation=retra.ComposeFinalRewardTransforms([retra.RoleAdvantageByEnvFormatter()]), step_reward_transformation=retra.ComposeStepRewardTransforms([retra.RewardForFormat(1.5), retra.PenaltyForInvalidMove(1.0, -1.0)]), sampling_reward_transformation=retra.ComposeSamplingRewardTransforms([retra.NormalizeRewardsByEnv(True)]))
+    _step_xforms_single = [retra.RewardForFormat(1.5), retra.PenaltyForInvalidMove(1.0, -1.0), retra.EnvStepReward(env_step_reward_scale)]
+    if algorithm in _STEP_BUFFER_ALGOS: buffer = unstable.StepBuffer.options(name="Buffer").remote(max_buffer_size=buffer_size, tracker=tracker, final_reward_transformation=retra.ComposeFinalRewardTransforms([retra.RoleAdvantageByEnvFormatter()]), step_reward_transformation=retra.ComposeStepRewardTransforms(_step_xforms_single), sampling_reward_transformation=retra.ComposeSamplingRewardTransforms([retra.NormalizeRewardsByEnv(True)]))
+    elif algorithm in _EPISODE_BUFFER_ALGOS: buffer = unstable.EpisodeBuffer.options(name="Buffer").remote(max_buffer_size=buffer_size, tracker=tracker, final_reward_transformation=retra.ComposeFinalRewardTransforms([retra.RoleAdvantageByEnvFormatter()]), step_reward_transformation=retra.ComposeStepRewardTransforms(_step_xforms_single), sampling_reward_transformation=retra.ComposeSamplingRewardTransforms([retra.NormalizeRewardsByEnv(True)]))
     else: raise NotImplementedError(f"The algorithm used ({algorithm}) has not been allocated to a specific buffer type.")
 
     # initialize the learner first so it reserves its GPU before the collector claims the rest for VLLM actors
@@ -94,7 +95,13 @@ def build_multirole(*, model_name: str, role_pids: Sequence[int], train_envs: Se
                     gradient_checkpointing: bool=True, use_trainer_cache: bool=False,
                     buffer_size: Optional[int]=None, vllm_config: Optional[dict]=None,
                     initial_lora_paths: Optional[dict]=None,
-                    wandb_project: str="UnstableBaselines"):
+                    wandb_project: str="UnstableBaselines",
+                    run_name_suffix: Optional[str]=None,
+                    env_step_reward_scale: float=1.0,
+                    initial_step: int=1,
+                    wandb_id: Optional[str]=None,
+                    wandb_resume: Optional[str]=None,
+                    run_name_override: Optional[str]=None):
     """Multi-role variant of build().
 
     - One shared learner on a single GPU holds N PEFT LoRAs (one per pid).
@@ -115,15 +122,27 @@ def build_multirole(*, model_name: str, role_pids: Sequence[int], train_envs: Se
     assert env_sampling_strategy in _ENV_SAMPLERS, f"env_sampling_strategy='{env_sampling_strategy}' not found"
     env_sampler = _ENV_SAMPLERS[env_sampling_strategy](train_env_specs=train_envs, eval_env_specs=eval_envs)
 
+    _suffix = f"-{run_name_suffix}" if run_name_suffix else ""
+    _run_name = run_name_override or f"UB-multirole-{algorithm}-{model_name.split('/')[-1]}-{env_sampler.env_list()}{_suffix}-{int(time.time())}"
     tracker = unstable.Tracker.options(name="Tracker").remote(
-        run_name=f"UB-multirole-{algorithm}-{model_name.split('/')[-1]}-{env_sampler.env_list()}-{int(time.time())}",
+        run_name=_run_name,
         wandb_project=wandb_project,
+        wandb_id=wandb_id,
+        wandb_resume=wandb_resume,
     )
 
     # one initial "base" entry per role pid (path=None means use the bare base model)
     model_registry = unstable.ModelRegistry.options(name="ModelRegistry").remote(tracker=tracker)
     for pid in role_pids:
         ray.get(model_registry.add_checkpoint.remote(uid=f"base-role-{pid}", path=None, iteration=0, role_pid=pid))
+    # On resume, promote the loaded LoRAs to the "current" ckpt per role so collectors serve
+    # from them instead of the base model until step (initial_step) completes.
+    if initial_lora_paths and initial_step > 1:
+        _prev_iter = initial_step - 1
+        for pid, path in initial_lora_paths.items():
+            if path:
+                ray.get(model_registry.add_checkpoint.remote(
+                    uid=f"ckpt-role{pid}-{_prev_iter}", path=str(path), iteration=_prev_iter, role_pid=pid))
 
     # eval substitutions register their OpenRouter names as fixed entries (so update_ratings works)
     team_sampler = unstable.samplers.FixedRoleTeamSampler(
@@ -143,10 +162,24 @@ def build_multirole(*, model_name: str, role_pids: Sequence[int], train_envs: Se
     BufferCls = unstable.EpisodeBuffer if use_episode else unstable.StepBuffer
 
     final_xforms = [] if algorithm == "grpo" else [retra.RoleAdvantageByEnvFormatter()]
-    step_xforms = [retra.RewardForFormat(1.5), retra.PenaltyForInvalidMove(1.0, -1.0)]
-    sampling_xforms = [retra.NormalizeRewardsByEnv(True)]
-    if normalize_adv_by_pid:
-        sampling_xforms.append(retra.NormalizeAdvantagesByPidEnv(z_score=True))
+    step_xforms = [retra.RewardForFormat(1.5), retra.PenaltyForInvalidMove(1.0, -1.0), retra.EnvStepReward(env_step_reward_scale)]
+    if env_step_reward_scale != 0.0 and not use_turn_scores:
+        import warnings
+        warnings.warn(
+            "env_step_reward_scale is non-zero but use_turn_scores=False; "
+            "per-step env rewards will be discarded by the learner. "
+            "Set use_turn_scores=True to keep them.",
+            RuntimeWarning, stacklevel=2,
+        )
+    # GRPO uses raw turn rewards to build return-to-go, then subtracts a per-(env, role, own_ckpt, opp_ckpts)
+    # trajectory-mean baseline inside compute_advantages. Any batch-level reward whitening here would
+    # distort R_{τ,k}; keep sampling_xforms empty for grpo.
+    if algorithm == "grpo":
+        sampling_xforms = []
+    else:
+        sampling_xforms = [retra.NormalizeRewardsByEnv(True)]
+        if normalize_adv_by_pid:
+            sampling_xforms.append(retra.NormalizeAdvantagesByPidEnv(z_score=True))
 
     buffers = {}
     for pid in role_pids:
@@ -169,6 +202,7 @@ def build_multirole(*, model_name: str, role_pids: Sequence[int], train_envs: Se
         buffers=buffers, tracker=tracker, model_registry=model_registry,
         activation_checkpointing=activation_checkpointing, gradient_checkpointing=gradient_checkpointing,
         use_trainer_cache=use_trainer_cache, initial_lora_paths=initial_lora_paths,
+        initial_step=initial_step,
     )
 
     match algorithm:

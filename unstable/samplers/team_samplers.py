@@ -60,7 +60,7 @@ class FixedRoleTeamSampler:
             agent_specs.append(AgentSpec(
                 pid=seat_pid, kind="checkpoint", collect_data=True, lora_path=lora_path,
                 prompt_template=env_spec.prompt_template, action_extraction_fn=env_spec.action_extraction_fn,
-                role_pid=role_pid,
+                role_pid=role_pid, model_uid=uid,
             ))
             models.append({"uid": uid, "pid": seat_pid, "type": "model", "role_pid": role_pid, "source": "checkpoint"})
         return agent_specs, models
@@ -70,7 +70,10 @@ class FixedRoleTeamSampler:
         for pid in range(env_spec.num_players):
             if pid in self.eval_substitutions:
                 openrouter_name = self.eval_substitutions[pid]
-                agent_specs.append(AgentSpec(pid=pid, kind="openrouter", lora_path=None, openrouter_name=openrouter_name))
+                agent_specs.append(AgentSpec(
+                    pid=pid, kind="openrouter", lora_path=None, openrouter_name=openrouter_name,
+                    model_uid=f"fixed-{openrouter_name}",
+                ))
                 models.append({"uid": f"fixed-{openrouter_name}", "pid": pid, "type": "opponent", "role_pid": pid, "source": "openrouter"})
             else:
                 assert pid in self.role_pids, f"pid {pid} not assigned to any role and not substituted"
@@ -78,6 +81,7 @@ class FixedRoleTeamSampler:
                 agent_specs.append(AgentSpec(
                     pid=pid, kind="checkpoint", collect_data=False, lora_path=lora_path,
                     prompt_template=env_spec.prompt_template, action_extraction_fn=env_spec.action_extraction_fn,
+                    model_uid=uid,
                 ))
                 models.append({"uid": uid, "pid": pid, "type": "model", "role_pid": pid, "source": "checkpoint"})
         return agent_specs, models

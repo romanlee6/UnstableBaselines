@@ -31,7 +31,7 @@ class A2CLearner(BaseLearner):
         # build the critic
         self.critic, _ = build_peft_model(self.model_name, self.device, self.lora_cfg, initial_lora_path, critic_model=True)
         if not self.use_trainer_cache:      self.policy_model.config.use_cache = False
-        if self.gradient_checkpointing:     self.policy_model.gradient_checkpointing_enable() # gradient checkpointing
+        if self.gradient_checkpointing:     self.policy_model.enable_input_require_grads(); self.policy_model.gradient_checkpointing_enable() # gradient checkpointing
         if self.activation_checkpointing:   enable_full_activation_ckpt(self.policy_model)       # activation checkpointing. Affords most of the vRAM savings
         self.critic_optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, self.critic.parameters()), lr=critic_learning_rate,)
 

@@ -10,7 +10,7 @@ the obs-only critic tokenization.
 import torch
 from contextlib import nullcontext
 from collections import defaultdict
-from typing import List, Optional, Tuple, Callable
+from typing import List, Optional, Tuple, Callable, Dict
 
 from unstable._types import Step
 from unstable.learners.a2c_learner import compute_gae
@@ -153,17 +153,43 @@ def compute_advantages(
         return steps
 
     if mode == "grpo":
-        groups = defaultdict(list)
-        for i, s in enumerate(steps): groups[(s.env_id, s.pid)].append(i)
-        for idxs in groups.values():
-            rs = torch.tensor([steps[i].reward for i in idxs], dtype=torch.float32)
-            if len(idxs) > 1:
-                adv = (rs - rs.mean()) / (rs.std() + 1e-8)
-            else:
-                # singleton group has no meaningful std - just demean (which is 0)
-                adv = rs - rs.mean()
-            for i, a in zip(idxs, adv):
-                _write_step_info(steps[i], advantage=float(a), **{"return": float(steps[i].reward)})
+        # A_{τ,k} = R_{τ,k} - μ_{env, role, own_ckpt, opp_ckpts}
+        # R_{τ,k}: turn-level return-to-go with γ=1.
+        # μ: equal-trajectory-weighted mean of G_τ = R_{τ,0} across trajectories in the group.
+        # Singleton-trajectory groups get zero advantage on every turn (no gradient contribution).
+        assert episodes is not None, "grpo requires EpisodeBuffer input (List[List[Step]])"
+        traj_r2g: List[List[float]] = []
+        traj_returns: List[float] = []
+        traj_keys: List[tuple] = []
+        for ep in episodes:
+            if not ep:
+                traj_r2g.append([]); traj_returns.append(0.0); traj_keys.append(())
+                continue
+            r2g = [0.0] * len(ep)
+            acc = 0.0
+            for k in range(len(ep) - 1, -1, -1):
+                acc += float(ep[k].reward)
+                r2g[k] = acc
+            traj_r2g.append(r2g)
+            traj_returns.append(r2g[0])
+            s0 = ep[0]
+            traj_keys.append((s0.env_id, s0.role_pid, s0.own_model_uid, s0.opponent_model_uids))
+        # equal-trajectory-weighted group means over G_τ
+        group_returns: Dict[tuple, List[float]] = defaultdict(list)
+        for key, G in zip(traj_keys, traj_returns):
+            if key: group_returns[key].append(G)
+        group_mu = {k: sum(v) / len(v) for k, v in group_returns.items()}
+        group_size = {k: len(v) for k, v in group_returns.items()}
+        for ep, r2g, key in zip(episodes, traj_r2g, traj_keys):
+            if not ep: continue
+            if group_size.get(key, 0) < 2:
+                # singleton group: skip gradient contribution.
+                for s, R in zip(ep, r2g):
+                    _write_step_info(s, advantage=0.0, **{"return": float(R)})
+                continue
+            mu = group_mu[key]
+            for s, R in zip(ep, r2g):
+                _write_step_info(s, advantage=float(R - mu), **{"return": float(R)})
         return steps
 
     if mode == "gae":

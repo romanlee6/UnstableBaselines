@@ -42,6 +42,16 @@ class MultiRolePPOLearner(MultiRoleBaseLearner):
         initial_critic_lora_paths: Optional[Dict[int, str]] = None,
     ):
         assert adv_estimator in ("gae", "grpo", "reinforce"), f"bad adv_estimator: {adv_estimator!r}"
+        if adv_estimator == "grpo":
+            assert use_turn_scores, (
+                "grpo builds turn-level return-to-go from raw per-turn rewards; "
+                "use_turn_scores=False would broadcast the terminal reward across all turns "
+                "and collapse R_{τ,k} into a mechanical scaling of G_τ."
+            )
+            assert not normalize_adv, (
+                "grpo advantages are already A_{τ,k} = R_{τ,k} - μ_{group}; "
+                "post-hoc batch whitening (normalize_adv=True) would destroy that structure."
+            )
         self.max_train_len = max_train_len
         self.max_generation_len = max_generation_len
         self.adv_estimator = adv_estimator
@@ -61,7 +71,7 @@ class MultiRolePPOLearner(MultiRoleBaseLearner):
                 cfg = self.role_lora_cfgs[pid]
                 init_path = (initial_critic_lora_paths or {}).get(pid)
                 critic, _ = build_peft_model(self.model_name, self.device, cfg, init_path, critic_model=True)
-                if self.gradient_checkpointing: critic.gradient_checkpointing_enable()
+                if self.gradient_checkpointing: critic.enable_input_require_grads(); critic.gradient_checkpointing_enable()
                 if self.activation_checkpointing: enable_full_activation_ckpt(critic)
                 self.critics[pid] = critic
                 self.critic_optimizers[pid] = torch.optim.AdamW(

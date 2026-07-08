@@ -51,7 +51,7 @@ class MultiRoleA2CLearner(MultiRoleBaseLearner):
             cfg = self.role_lora_cfgs[pid]
             init_path = (initial_critic_lora_paths or {}).get(pid)
             critic, _ = build_peft_model(self.model_name, self.device, cfg, init_path, critic_model=True)
-            if self.gradient_checkpointing: critic.gradient_checkpointing_enable()
+            if self.gradient_checkpointing: critic.enable_input_require_grads(); critic.gradient_checkpointing_enable()
             if self.activation_checkpointing: enable_full_activation_ckpt(critic)
             self.critics[pid] = critic
             self.critic_optimizers[pid] = torch.optim.AdamW(

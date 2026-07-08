@@ -20,7 +20,8 @@ class MultiRoleBaseLearner:
                  batch_size: int, mini_batch_size: int, learning_rate: float, grad_clip: float,
                  buffers: Dict[int, BaseBuffer], tracker: BaseTracker, model_registry,
                  activation_checkpointing: bool=True, gradient_checkpointing: bool=True,
-                 use_trainer_cache: bool=False, initial_lora_paths: Optional[Dict[int, str]]=None):
+                 use_trainer_cache: bool=False, initial_lora_paths: Optional[Dict[int, str]]=None,
+                 initial_step: int=1):
         self.model_name, self.role_lora_cfgs = model_name, role_lora_cfgs
         self.buffers, self.tracker, self.model_registry = buffers, tracker, model_registry
         self.logger = setup_logger("multirole_learner", ray.get(tracker.get_log_dir.remote()))
@@ -40,7 +41,7 @@ class MultiRoleBaseLearner:
         self.policy_model.to(torch.bfloat16)
 
         if not self.use_trainer_cache:    self.policy_model.config.use_cache = False
-        if self.gradient_checkpointing:   self.policy_model.gradient_checkpointing_enable()
+        if self.gradient_checkpointing:   self.policy_model.enable_input_require_grads(); self.policy_model.gradient_checkpointing_enable()
         if self.activation_checkpointing: enable_full_activation_ckpt(self.policy_model)
 
         # one AdamW per role. set_adapter(role) flips requires_grad so only that role's params show up.
@@ -55,7 +56,7 @@ class MultiRoleBaseLearner:
             self.policy_optimizers[pid] = torch.optim.AdamW(params, lr=learning_rate)
             self.logger.info(f"built AdamW for role-{pid} over {len(params)} param tensors")
 
-        self._step = 1; self._samples_seen: Dict[int, int] = {pid: 0 for pid in self.role_pids}
+        self._step = initial_step; self._samples_seen: Dict[int, int] = {pid: 0 for pid in self.role_pids}
 
     def initialize_algorithm(self, *args, **kwargs): raise NotImplementedError
     def _update(self, role_pid: int, batch):         raise NotImplementedError
