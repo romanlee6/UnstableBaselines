@@ -183,6 +183,7 @@ class PublicGoodsGameEnv(ta.Env):
     def _handle_conversation_phase(self, action: str):
         # Extract only the public message portion
         public_message = self._extract_public_message(action)
+        self.state.step_info.setdefault("phase_format_valid_by_pid", {})[self.state.current_player_id] = public_message is not None
         
         # Store the public message (or None if no public message was sent)
         self.state.game_state["pending_messages"][self.state.current_player_id] = public_message
@@ -254,9 +255,13 @@ class PublicGoodsGameEnv(ta.Env):
         # parse first integer inside <...>; None if unparseable
         m = self.prediction_pattern.search(action)
         pred = int(m.group(1)) if m else None
+        alive_players = [p for p in range(self.state.num_players) if self.state.is_player_alive(p)]
+        max_pool = self.state.game_state["endowment"] * len(alive_players)
+        if pred is not None and not 0 <= pred <= max_pool:
+            pred = None
+        self.state.step_info.setdefault("phase_format_valid_by_pid", {})[self.state.current_player_id] = pred is not None
         self.state.game_state["pending_predictions"][self.state.current_player_id] = pred
 
-        alive_players = [p for p in range(self.state.num_players) if self.state.is_player_alive(p)]
         if all(p in self.state.game_state["pending_predictions"] for p in alive_players):
             self.state.game_state["last_predictions"] = dict(self.state.game_state["pending_predictions"])
             self.state.game_state["pending_predictions"] = {}
@@ -276,8 +281,10 @@ class PublicGoodsGameEnv(ta.Env):
             contribution = int(match.group(1))
             # Validate contribution
             if 0 <= contribution <= self.state.game_state["endowment"]:
+                self.state.step_info.setdefault("phase_format_valid_by_pid", {})[self.state.current_player_id] = True
                 self.state.game_state["pending_contributions"][self.state.current_player_id] = contribution
             else:
+                self.state.step_info.setdefault("phase_format_valid_by_pid", {})[self.state.current_player_id] = False
                 # Invalid contribution - use the state's invalid move handling
                 eliminated = self.state.set_invalid_move(
                     f"Invalid contribution {contribution}. Must be between 0 and {self.state.game_state['endowment']}."
@@ -293,6 +300,7 @@ class PublicGoodsGameEnv(ta.Env):
                         observation_type=ta.ObservationType.GAME_MESSAGE
                     )
         else:
+            self.state.step_info.setdefault("phase_format_valid_by_pid", {})[self.state.current_player_id] = False
             # No valid contribution found - use the state's invalid move handling
             eliminated = self.state.set_invalid_move(
                 f"No valid contribution found. Please use format '[X]' where X is 0-{self.state.game_state['endowment']}."
@@ -416,7 +424,14 @@ class PublicGoodsGameEnv(ta.Env):
 
         # Publish per-step env reward via step_info; collector distributes to each pid's last step
         if self.use_step_rewards and step_rewards:
-            self.state.step_info.setdefault("step_rewards_by_pid", {}).update(step_rewards)
+            self.state.step_info.setdefault("step_rewards_by_pid", {}).update({
+                pid: float(round_info["payoffs"][pid]) for pid in alive_players
+            })
+            if self.enable_prediction:
+                self.state.step_info["prediction_rewards_by_pid"] = {
+                    pid: step_rewards[pid] - round_info["payoffs"][pid]
+                    for pid in alive_players
+                }
 
         # Announce results
         self.state.add_observation(

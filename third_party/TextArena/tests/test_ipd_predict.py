@@ -3,7 +3,7 @@
 Exercises:
   - simultaneous broadcast comm (opponent should NOT see your message until both submit)
   - prediction phase with private prompts
-  - per-round payoff + prediction bonus written to state.step_info["step_rewards_by_pid"]
+  - decision payoff and prediction bonus emitted as separate reward payloads
 """
 import textarena as ta
 
@@ -69,13 +69,40 @@ def test_ipd_predict():
     pid, _ = env.get_observation()
     done, step_info = env.step("[Cooperate]")
 
-    # This is the step that triggered resolution — step_info should include payoffs
+    # This is the step that triggered resolution — payoffs go to decision steps,
+    # while prediction bonuses are separately routed to prediction steps by UB.
     assert "step_rewards_by_pid" in step_info, f"missing step_rewards_by_pid: {step_info}"
+    assert "prediction_rewards_by_pid" in step_info, f"missing prediction rewards: {step_info}"
     srp = step_info["step_rewards_by_pid"]
+    prp = step_info["prediction_rewards_by_pid"]
     assert set(srp.keys()) == {0, 1}
-    # payoff for mutual cooperate = 3; pid 0 predicted correctly (+1), pid 1 predicted wrong (+0)
-    assert srp[0] == 3.0 + 1.0, f"expected 4.0, got {srp[0]}"
+    # payoff for mutual cooperate = 3; pid 0 predicted correctly (+1), pid 1 wrong (+0)
+    assert srp[0] == 3.0, f"expected 3.0, got {srp[0]}"
     assert srp[1] == 3.0, f"expected 3.0, got {srp[1]}"
+    assert prp == {0: 1.0, 1: 0.0}, prp
+
+
+def test_ipd_predict_retry_still_resolves_shaped_rewards():
+    """A repairable format miss must not suppress the round's reward signal."""
+    env = ta.make("IteratedPrisonersDilemma-Predict-v0-train")
+    env.reset(num_players=2, seed=0)
+    env.state.error_allowance = 2
+
+    # Finish simultaneous communication and prediction.
+    for action in ("{cooperate}", "{cooperate}", "<Cooperate>", "<Cooperate>"):
+        done, _ = env.step(action)
+        assert not done
+
+    # Player 0 repairs one malformed decision, then both decisions resolve.
+    done, info = env.step("not a valid decision")
+    assert not done
+    assert info["phase_format_valid_by_pid"] == {0: False}
+    done, _ = env.step("[Cooperate]")
+    assert not done
+    done, info = env.step("[Cooperate]")
+    assert not done
+    assert info["step_rewards_by_pid"] == {0: 3.0, 1: 3.0}
+    assert info["prediction_rewards_by_pid"] == {0: 1.0, 1: 1.0}
 
 
 if __name__ == "__main__":

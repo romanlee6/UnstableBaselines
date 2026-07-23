@@ -9,14 +9,19 @@ from ray.exceptions import RayActorError, RayTaskError
 import textarena as ta
 assert ta.__version__ >= "0.6.16", f"TextArena package version is too old: {ta.__version__}. Required version is at least 0.6.16."
 
-# env state.error_allowance is hardcoded to 0 by default below; override via the
-# UB_ERROR_ALLOWANCE env var. Ray remote workers inherit os.environ from the driver
-# at task submission, so setting this in the driver before ray.init is enough.
-_ERROR_ALLOWANCE = int(os.environ.get("UB_ERROR_ALLOWANCE", "0"))
+# Give a model a small number of chances to repair a malformed phase action.
+# With zero allowance, one bad base-model response ends the entire game before
+# prediction accuracy and round payoffs can be resolved, starving reward shaping
+# (and often the second role's buffer). Ray workers inherit this override from the
+# driver, so strict/evaluation runs can still set UB_ERROR_ALLOWANCE=0 explicitly.
+_ERROR_ALLOWANCE = int(os.environ.get("UB_ERROR_ALLOWANCE", "2"))
+if _ERROR_ALLOWANCE < 0:
+    raise ValueError("UB_ERROR_ALLOWANCE must be non-negative")
 
 # local imports
 from unstable.actor import VLLMActor
 from unstable._types import GameSpec, GameInformation, PlayerTrajectory, TaskMeta
+from unstable.external_agents import build_external_agent
 from unstable.utils.logging import setup_logger
 from unstable.utils.templates import ACTION_EXTRACTION, OBSERVATION_FORMATTING
 
@@ -47,11 +52,12 @@ def run_game(game_spec: GameSpec, actor: VLLMActor):
             opponent_model_uids=tuple(sorted(u for p, u in uid_by_pid.items() if p != agent_spec.pid and u is not None)),
         ) if agent_spec.collect_data else None,
         "name": agent_spec.lora_path if agent_spec.lora_path else agent_spec.openrouter_name,
-        "model": CallableActorWrapper(actor=actor, lora_path=agent_spec.lora_path, obs_fmt_fn=OBSERVATION_FORMATTING[agent_spec.prompt_template], extract_fn=ACTION_EXTRACTION[agent_spec.action_extraction_fn]) if agent_spec.openrouter_name==None else ta.agents.OpenRouterAgent(agent_spec.openrouter_name)
+        "model": CallableActorWrapper(actor=actor, lora_path=agent_spec.lora_path, obs_fmt_fn=OBSERVATION_FORMATTING[agent_spec.prompt_template], extract_fn=ACTION_EXTRACTION[agent_spec.action_extraction_fn]) if agent_spec.openrouter_name==None else build_external_agent(agent_spec.external_provider or "openrouter", agent_spec.openrouter_name)
     } for agent_spec in game_spec.agent_specs} # build agents
     env=ta.make(game_spec.env_id); env.reset(num_players=len(agents), seed=game_spec.seed); env.state.error_allowance=_ERROR_ALLOWANCE; turn=0
     while True:
         pid, obs = env.get_observation()
+        phase = getattr(env.state, "game_state", {}).get("phase")
         # get model (or opponent) action
         if agents[pid]["traj"] == None: raw = extracted = agents[pid]["model"](obs) # fix opponent
         else: raw, extracted, prompt, format_feedback = agents[pid]["model"].act_full(obs)
@@ -62,8 +68,12 @@ def run_game(game_spec: GameSpec, actor: VLLMActor):
         # player specific trackering
         if agents[pid]["traj"] != None:
             agents[pid]["traj"].obs.append(obs); agents[pid]["traj"].actions.append(raw); agents[pid]["traj"].extracted_actions.append(extracted)
-            format_feedback["invalid_move"] = False; agents[pid]["traj"].format_feedbacks.append(format_feedback); agents[pid]["traj"].step_infos.append(step_info)
+            format_feedback["invalid_move"] = False
+            phase_valid = (step_info or {}).get("phase_format_valid_by_pid", {}).get(pid)
+            if phase_valid is not None: format_feedback["phase_format_valid"] = bool(phase_valid)
+            agents[pid]["traj"].format_feedbacks.append(format_feedback); agents[pid]["traj"].step_infos.append(step_info)
             agents[pid]["traj"].step_rewards.append(0.0)
+            agents[pid]["traj"].step_phases.append(phase)
         # distribute per-step env rewards keyed by pid (contract: env writes
         # state.step_info["step_rewards_by_pid"] = {pid: float, ...}); missing/empty = no-op.
         # rewards land on each pid's most-recent trajectory step, which handles both
@@ -73,6 +83,30 @@ def run_game(game_spec: GameSpec, actor: VLLMActor):
             t = agents.get(tgt_pid, {}).get("traj")
             if t is not None and t.step_rewards:
                 t.step_rewards[-1] += float(r)
+        # Prediction bonuses are resolved only after decisions are known, but
+        # belong to the earlier prediction completion rather than the decision.
+        prp = (step_info or {}).get("prediction_rewards_by_pid") or {}
+        for tgt_pid, r in prp.items():
+            t = agents.get(tgt_pid, {}).get("traj")
+            if t is None: continue
+            for idx in range(len(t.step_phases) - 1, -1, -1):
+                if t.step_phases[idx] == "prediction":
+                    t.step_rewards[idx] += float(r)
+                    break
+        # Round outcomes are known only after both decisions. Attach them to
+        # each player's corresponding decision completion for phase metrics.
+        if (step_info or {}).get("round_decisions_by_pid") is not None:
+            outcome_info = {
+                "round_decisions_by_pid": dict(step_info["round_decisions_by_pid"]),
+                "mutual_cooperation": bool(step_info.get("mutual_cooperation")),
+            }
+            for data in agents.values():
+                t = data.get("traj")
+                if t is None: continue
+                for idx in range(len(t.step_phases) - 1, -1, -1):
+                    if t.step_phases[idx] == "decision":
+                        t.step_infos[idx] = dict(t.step_infos[idx] or {}, **outcome_info)
+                        break
         if done: break
     final_rewards, game_info = env.close()
     for pid in agents.keys():
@@ -131,7 +165,7 @@ class Collector:
     def _handle_finished_job(self, ref):
         meta = self.flight.pop(ref)
         try: game_information, player_trajs = ray.get(ref)
-        except (RayTaskError, RayActorError) as err: self.logger.error(f"Remote episode failed for {meta.type} task: env={meta.env_id}: {err}", exc_info=True); return
+        except Exception as err: self.logger.error(f"Remote episode failed for {meta.type} task: env={meta.env_id}: {err}", exc_info=True); return
         self._post_train(meta, game_information, player_trajs) if meta.type=="train" else self._post_eval(meta, game_information)
     
     def _post_train(self, meta: TaskMeta, game_information: GameInformation, player_trajs: List[PlayerTrajectory]):

@@ -31,6 +31,21 @@ class NormalizeRewardsByEnv(SamplingRewardTransform):
             for s, nr in zip(env_steps, normed): s.reward = float(nr) # write back
         return steps
 
+class NormalizeRewardsByEnvPhase(SamplingRewardTransform):
+    """Mean-center rewards independently for every environment/phase bucket."""
+    def __call__(self, steps: List[Step], env_id: Optional[str] = None) -> List[Step]:
+        buckets = defaultdict(list)
+        for step in steps:
+            buckets[(step.env_id, step.phase)].append(step)
+        for phase_steps in buckets.values():
+            mean = float(np.mean([step.reward for step in phase_steps]))
+            for step in phase_steps:
+                step.reward_components["reward_before_normalization"] = float(step.reward)
+                step.reward_components["normalization_mean"] = mean
+                step.reward = float(step.reward - mean)
+                step.reward_components["normalized_reward"] = float(step.reward)
+        return steps
+
 class NormalizeAdvantagesByPidEnv(SamplingRewardTransform):
     # Per-(env_id, pid) z-score (or mean-subtract) at batch-sampling time. In multirole
     # each role's buffer holds a single pid so the grouping collapses to per-env; in
@@ -44,4 +59,3 @@ class NormalizeAdvantagesByPidEnv(SamplingRewardTransform):
             normed = ((r - r.mean()) / (r.std() + 1e-8)) if self.z_score else r - r.mean()
             for s, nr in zip(grp, normed): s.reward = float(nr)
         return steps
-

@@ -11,7 +11,20 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))) +
 
 import textarena as ta
 from unstable._types import PlayerTrajectory
-from unstable.reward_transformations.transformation_step import EnvStepReward
+from unstable.reward_transformations.transformation_step import EnvStepReward, RewardForFormat
+from unstable.utils.templates import extract_action_and_format_feedback
+
+
+def _apply_env_rewards(trajs, step_info):
+    """Mirror collector reward routing, including deferred prediction bonuses."""
+    for tgt, r in ((step_info or {}).get("step_rewards_by_pid") or {}).items():
+        if trajs[tgt].step_rewards:
+            trajs[tgt].step_rewards[-1] += float(r)
+    for tgt, r in ((step_info or {}).get("prediction_rewards_by_pid") or {}).items():
+        for i in range(len(trajs[tgt].step_phases) - 1, -1, -1):
+            if trajs[tgt].step_phases[i] == "prediction":
+                trajs[tgt].step_rewards[i] += float(r)
+                break
 
 
 def run_scripted_game(env_id: str, actions_by_pid: dict, num_players: int):
@@ -23,6 +36,7 @@ def run_scripted_game(env_id: str, actions_by_pid: dict, num_players: int):
         pid, obs = env.get_observation()
         act = actions_by_pid[pid][turn_counters[pid]]
         turn_counters[pid] += 1
+        phase = env.state.game_state.get("phase")
         done, step_info = env.step(act)
         # per-turn tracking
         trajs[pid].obs.append(obs); trajs[pid].actions.append(act)
@@ -30,12 +44,8 @@ def run_scripted_game(env_id: str, actions_by_pid: dict, num_players: int):
         trajs[pid].format_feedbacks.append({"correct_answer_format": True, "invalid_move": False})
         trajs[pid].step_infos.append(step_info)
         trajs[pid].step_rewards.append(0.0)
-        # collector distributes step_rewards_by_pid
-        srp = (step_info or {}).get("step_rewards_by_pid") or {}
-        for tgt, r in srp.items():
-            t = trajs.get(tgt)
-            if t is not None and t.step_rewards:
-                t.step_rewards[-1] += float(r)
+        trajs[pid].step_phases.append(phase)
+        _apply_env_rewards(trajs, step_info)
         if done: break
     return trajs
 
@@ -58,24 +68,23 @@ def test_ipd_predict_collector_flow():
     while True:
         pid, obs = env.get_observation()
         act = actions[pid][turn[pid]]; turn[pid] += 1
+        phase = env.state.game_state.get("phase")
         done, step_info = env.step(act)
         trajs[pid].obs.append(obs); trajs[pid].actions.append(act)
         trajs[pid].extracted_actions.append(act)
         trajs[pid].format_feedbacks.append({"correct_answer_format": True, "invalid_move": False})
         trajs[pid].step_infos.append(step_info)
         trajs[pid].step_rewards.append(0.0)
-        srp = (step_info or {}).get("step_rewards_by_pid") or {}
-        for tgt, r in srp.items():
-            t = trajs.get(tgt)
-            if t is not None and t.step_rewards:
-                t.step_rewards[-1] += float(r)
+        trajs[pid].step_phases.append(phase)
+        _apply_env_rewards(trajs, step_info)
         if done: break
 
-    # Each pid took 3 steps (comm, pred, decision). Only the last one has non-zero reward.
+    # Each pid took 3 steps (comm, pred, decision). Prediction reward belongs
+    # to prediction; payoff belongs to decision.
     assert len(trajs[0].step_rewards) == 3
     assert trajs[0].step_rewards[0] == 0.0
-    assert trajs[0].step_rewards[1] == 0.0
-    assert trajs[0].step_rewards[2] == 4.0, trajs[0].step_rewards  # 3 (mut coop) + 1 (correct pred)
+    assert trajs[0].step_rewards[1] == 1.0, trajs[0].step_rewards
+    assert trajs[0].step_rewards[2] == 3.0, trajs[0].step_rewards
     assert trajs[1].step_rewards[2] == 3.0, trajs[1].step_rewards  # 3 (mut coop) + 0 (wrong pred)
 
     # EnvStepReward transform applies scale
@@ -86,6 +95,20 @@ def test_ipd_predict_collector_flow():
             assert got == sr, (pid, i, sr, got)
 
 
+def test_boxed_payload_is_preserved():
+    assert extract_action_and_format_feedback(r"\boxed{{hello}}") == ("{hello}", {"correct_answer_format": True})
+    assert extract_action_and_format_feedback(r"\boxed{<Cooperate>}") == ("<Cooperate>", {"correct_answer_format": True})
+    assert extract_action_and_format_feedback(r"\boxed{[Cooperate]}") == ("[Cooperate]", {"correct_answer_format": True})
+    traj = PlayerTrajectory(format_feedbacks=[
+        {"correct_answer_format": True, "phase_format_valid": True},
+        {"correct_answer_format": True, "phase_format_valid": False},
+    ])
+    xform = RewardForFormat(reward=1.5, penalty=0.0)
+    assert xform(traj, 0, 0.0) == 1.5
+    assert xform(traj, 1, 0.0) == 0.0
+
+
 if __name__ == "__main__":
     test_ipd_predict_collector_flow()
+    test_boxed_payload_is_preserved()
     print("OK")

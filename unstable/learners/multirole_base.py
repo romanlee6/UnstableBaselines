@@ -1,4 +1,4 @@
-import ray, torch, time, pathlib
+import os, ray, torch, time, pathlib
 from typing import List, Dict, Any, Optional
 
 from unstable.buffers import BaseBuffer
@@ -21,7 +21,8 @@ class MultiRoleBaseLearner:
                  buffers: Dict[int, BaseBuffer], tracker: BaseTracker, model_registry,
                  activation_checkpointing: bool=True, gradient_checkpointing: bool=True,
                  use_trainer_cache: bool=False, initial_lora_paths: Optional[Dict[int, str]]=None,
-                 initial_step: int=1):
+                 initial_step: int=1, initial_samples_seen: Optional[Dict[int, int]]=None,
+                 initial_training_state_path: Optional[str]=None):
         self.model_name, self.role_lora_cfgs = model_name, role_lora_cfgs
         self.buffers, self.tracker, self.model_registry = buffers, tracker, model_registry
         self.logger = setup_logger("multirole_learner", ray.get(tracker.get_log_dir.remote()))
@@ -56,7 +57,16 @@ class MultiRoleBaseLearner:
             self.policy_optimizers[pid] = torch.optim.AdamW(params, lr=learning_rate)
             self.logger.info(f"built AdamW for role-{pid} over {len(params)} param tensors")
 
-        self._step = initial_step; self._samples_seen: Dict[int, int] = {pid: 0 for pid in self.role_pids}
+        self._step = initial_step
+        initial_samples_seen = initial_samples_seen or {}
+        self._samples_seen: Dict[int, int] = {
+            pid: int(initial_samples_seen.get(pid, 0)) for pid in self.role_pids
+        }
+        # Algorithm-specific initialization happens after __init__, so defer the
+        # restore until train() starts.  This also makes the hook safe for future
+        # optimizers created by initialize_algorithm().
+        self._initial_training_state_path = initial_training_state_path
+        self._training_state_restored = False
 
     def initialize_algorithm(self, *args, **kwargs): raise NotImplementedError
     def _update(self, role_pid: int, batch):         raise NotImplementedError
@@ -64,11 +74,12 @@ class MultiRoleBaseLearner:
     def _ready_roles(self) -> List[int]:
         ready = []
         for pid in self.role_pids:
-            if ray.get(self.buffers[pid].size.remote()) >= self.batch_size * 1.5:
+            if ray.get(self.buffers[pid].ready_for_batch.remote(self.batch_size)):
                 ready.append(pid)
         return ready
 
     def train(self, iterations: int):
+        self._restore_training_state()
         self.logger.info(f"Starting multi-role training loop over roles={self.role_pids}")
         while self._step < iterations:
             try:
@@ -92,6 +103,11 @@ class MultiRoleBaseLearner:
                         self.logger.info(f"registered ckpt role-{pid} step {self._step} -> {ckpt_path}")
                     except Exception as exc: self.logger.info(f"add_checkpoint failed for role-{pid}: {exc}")
 
+                # Only publish resumable state when every role has an adapter for
+                # this iteration. A preemption between role updates therefore
+                # falls back to the preceding complete, internally consistent step.
+                if self._iteration_is_complete():
+                    self._save_training_state()
                 self._step += 1
             except Exception as exc:
                 self.logger.exception(f"Exception in multirole learner loop: {exc}")
@@ -117,3 +133,148 @@ class MultiRoleBaseLearner:
             # we care about is still iter_dir/<adapter_name>/, so the return path stays correct.
             self.policy_model.save_pretrained(iter_dir)
         return iter_dir / adapter_name
+
+    def _iteration_is_complete(self) -> bool:
+        iter_dir = self.ckpt_dir / f"iteration-{self._step}"
+        return all(
+            (iter_dir / role_adapter_name(pid) / "adapter_config.json").is_file()
+            and (iter_dir / role_adapter_name(pid) / "adapter_model.safetensors").is_file()
+            for pid in self.role_pids
+        )
+
+    @staticmethod
+    def _cpu_gradient_state(module: torch.nn.Module) -> Dict[str, torch.Tensor]:
+        return {
+            name: param.grad.detach().cpu()
+            for name, param in module.named_parameters()
+            if param.grad is not None
+        }
+
+    @staticmethod
+    def _cpu_trainable_parameter_state(module: torch.nn.Module) -> Dict[str, torch.Tensor]:
+        return {
+            name: param.detach().cpu()
+            for name, param in module.named_parameters()
+            if param.requires_grad
+        }
+
+    def _save_training_state(self) -> pathlib.Path:
+        """Atomically save the state needed to continue after a completed update.
+
+        Adapter weights remain in PEFT's vLLM-compatible directories. AdamW
+        moments, parameter gradients, counters, and torch RNG state live in one
+        training_state.pt beside that iteration. Older training-state files are
+        removed so optimizer checkpoints do not multiply disk usage.
+        """
+        iter_dir = self.ckpt_dir / f"iteration-{self._step}"
+        state_path = iter_dir / "training_state.pt"
+        tmp_path = iter_dir / f".{state_path.name}.{os.getpid()}.tmp"
+        state = {
+            "format_version": 1,
+            "step": self._step,
+            "samples_seen": dict(self._samples_seen),
+            "policy_optimizers": {
+                pid: optimizer.state_dict()
+                for pid, optimizer in self.policy_optimizers.items()
+            },
+            "policy_gradients": self._cpu_gradient_state(self.policy_model),
+            "torch_rng_state": torch.get_rng_state(),
+        }
+        if torch.cuda.is_available():
+            state["cuda_rng_state_all"] = [rng.cpu() for rng in torch.cuda.get_rng_state_all()]
+        critics = getattr(self, "critics", {})
+        critic_optimizers = getattr(self, "critic_optimizers", {})
+        if critics:
+            # Critic base-model parameters are frozen, so save only trainable
+            # LoRA/value-head tensors rather than duplicating the full backbone.
+            state["critic_parameters"] = {
+                pid: self._cpu_trainable_parameter_state(critic)
+                for pid, critic in critics.items()
+            }
+            state["critic_gradients"] = {
+                pid: self._cpu_gradient_state(critic)
+                for pid, critic in critics.items()
+            }
+            state["critic_optimizers"] = {
+                pid: optimizer.state_dict()
+                for pid, optimizer in critic_optimizers.items()
+            }
+
+        torch.save(state, tmp_path)
+        os.replace(tmp_path, state_path)
+
+        # Keep exactly the newest complete optimizer/gradient state. The adapter
+        # history stays untouched and can still be used for evaluation.
+        for old_path in self.ckpt_dir.glob("iteration-*/training_state.pt"):
+            if old_path != state_path:
+                try:
+                    old_path.unlink()
+                except OSError as exc:
+                    self.logger.warning(f"could not remove old training state {old_path}: {exc}")
+        self.logger.info(f"saved resumable training state -> {state_path}")
+        return state_path
+
+    def _restore_training_state(self) -> None:
+        if self._training_state_restored:
+            return
+        self._training_state_restored = True
+        if not self._initial_training_state_path:
+            return
+
+        state_path = pathlib.Path(self._initial_training_state_path)
+        state = torch.load(state_path, map_location=self.device, weights_only=False)
+        if state.get("format_version") != 1:
+            raise RuntimeError(f"unsupported training-state format in {state_path}")
+        expected_step = self._step - 1
+        if int(state["step"]) != expected_step:
+            raise RuntimeError(
+                f"training state {state_path} is for step {state['step']}, "
+                f"but resume expects completed step {expected_step}"
+            )
+
+        optimizer_states = state["policy_optimizers"]
+        for pid, optimizer in self.policy_optimizers.items():
+            saved = optimizer_states.get(pid, optimizer_states.get(str(pid)))
+            if saved is None:
+                raise RuntimeError(f"training state has no optimizer for role-{pid}")
+            optimizer.load_state_dict(saved)
+
+        critics = getattr(self, "critics", {})
+        critic_optimizer_states = state.get("critic_optimizers", {})
+        critic_parameter_states = state.get("critic_parameters", {})
+        critic_gradient_states = state.get("critic_gradients", {})
+        for pid, critic in critics.items():
+            saved_parameters = critic_parameter_states.get(pid, critic_parameter_states.get(str(pid)))
+            saved_optimizer = critic_optimizer_states.get(pid, critic_optimizer_states.get(str(pid)))
+            if saved_parameters is None or saved_optimizer is None:
+                raise RuntimeError(f"training state has no critic state for role-{pid}")
+            named_critic_parameters = dict(critic.named_parameters())
+            with torch.no_grad():
+                for name, value in saved_parameters.items():
+                    if name not in named_critic_parameters:
+                        raise RuntimeError(f"critic role-{pid} has no saved parameter {name!r}")
+                    named_critic_parameters[name].copy_(value)
+            getattr(self, "critic_optimizers")[pid].load_state_dict(saved_optimizer)
+            saved_gradients = critic_gradient_states.get(pid, critic_gradient_states.get(str(pid), {}))
+            for name, gradient in saved_gradients.items():
+                if name in named_critic_parameters:
+                    named_critic_parameters[name].grad = gradient.to(
+                        device=named_critic_parameters[name].device,
+                        dtype=named_critic_parameters[name].dtype,
+                    )
+
+        named_parameters = dict(self.policy_model.named_parameters())
+        for name, gradient in state.get("policy_gradients", {}).items():
+            if name in named_parameters:
+                named_parameters[name].grad = gradient.to(
+                    device=named_parameters[name].device,
+                    dtype=named_parameters[name].dtype,
+                )
+        torch.set_rng_state(state["torch_rng_state"].cpu())
+        if torch.cuda.is_available() and "cuda_rng_state_all" in state:
+            torch.cuda.set_rng_state_all([rng.cpu() for rng in state["cuda_rng_state_all"]])
+        self._samples_seen = {
+            pid: int(state["samples_seen"].get(pid, state["samples_seen"].get(str(pid), 0)))
+            for pid in self.role_pids
+        }
+        self.logger.info(f"restored optimizer, gradients, counters, and RNG from {state_path}")

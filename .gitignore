@@ -185,7 +185,7 @@ checkpoint*
 *.zip
 checkpoint*
 
-outputs/*
+/outputs
 sandbox.rst
 
 _local/*

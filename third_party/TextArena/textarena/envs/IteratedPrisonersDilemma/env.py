@@ -152,6 +152,7 @@ class IteratedPrisonersDilemmaEnv(ta.Env):
     def _handle_conversation_broadcast(self, action: str):
         # PGG-style: buffer per pid, broadcast only after both submit
         public_msg = self._extract_public_message(action)
+        self.state.step_info.setdefault("phase_format_valid_by_pid", {})[self.state.current_player_id] = public_msg is not None
         self.state.game_state["pending_messages"][self.state.current_player_id] = public_msg
         if all(p in self.state.game_state["pending_messages"] for p in range(2)):
             lines = []
@@ -212,6 +213,7 @@ class IteratedPrisonersDilemmaEnv(ta.Env):
 
     def _handle_prediction_phase(self, action: str):
         pred = self._parse_prediction(action)
+        self.state.step_info.setdefault("phase_format_valid_by_pid", {})[self.state.current_player_id] = pred is not None
         # store None if unparseable; scored as a miss
         self.state.game_state["pending_predictions"][self.state.current_player_id] = pred
         if all(p in self.state.game_state["pending_predictions"] for p in range(2)):
@@ -232,6 +234,7 @@ class IteratedPrisonersDilemmaEnv(ta.Env):
         has_defect = bool(self.defect_pattern.search(action))
         has_cooperate = bool(self.cooperate_pattern.search(action))
         if has_defect == has_cooperate:
+            self.state.step_info.setdefault("phase_format_valid_by_pid", {})[self.state.current_player_id] = False
             reason = (
                 "Decision must contain exactly one of '[Cooperate]' or '[Defect]'."
                 if not has_defect
@@ -240,6 +243,7 @@ class IteratedPrisonersDilemmaEnv(ta.Env):
             self.state.set_invalid_move(reason=reason)
             return
         decision = "defect" if has_defect else "cooperate"
+        self.state.step_info.setdefault("phase_format_valid_by_pid", {})[self.state.current_player_id] = True
         self.state.game_state["decisions"][self.state.current_player_id] = decision
 
         if all(d is not None for d in self.state.game_state["decisions"].values()):
@@ -274,6 +278,8 @@ class IteratedPrisonersDilemmaEnv(ta.Env):
 
         self.state.game_state["scores"][0] += r0
         self.state.game_state["scores"][1] += r1
+        self.state.step_info["round_decisions_by_pid"] = {0: d0, 1: d1}
+        self.state.step_info["mutual_cooperation"] = d0 == d1 == "cooperate"
 
         # prediction scoring — reward is added on top of payoff for the same step
         pred_bonus = {0: 0.0, 1: 0.0}
@@ -300,8 +306,10 @@ class IteratedPrisonersDilemmaEnv(ta.Env):
         # publish per-step env reward via step_info; collector distributes to each pid's last step
         if self.use_step_rewards:
             step_rewards = self.state.step_info.setdefault("step_rewards_by_pid", {})
-            step_rewards[0] = float(r0) + pred_bonus[0]
-            step_rewards[1] = float(r1) + pred_bonus[1]
+            step_rewards[0] = float(r0)
+            step_rewards[1] = float(r1)
+            if self.enable_prediction:
+                self.state.step_info["prediction_rewards_by_pid"] = pred_bonus
 
         self.state.add_observation(
             message=(

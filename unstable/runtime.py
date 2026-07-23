@@ -77,6 +77,7 @@ def build(*, model_name: str, train_envs: Sequence[unstable.TrainEnvSpec], eval_
 def build_multirole(*, model_name: str, role_pids: Sequence[int], train_envs: Sequence[unstable.TrainEnvSpec],
                     eval_envs: Optional[Sequence[unstable.EvalEnvSpec]]=None,
                     eval_substitutions: Optional[dict]=None,
+                    eval_provider: str="openrouter",
                     env_sampling_strategy: str = "random",
                     role_lora_cfgs: Optional[dict]=None,
                     shuffle_roles: bool = True,
@@ -98,7 +99,14 @@ def build_multirole(*, model_name: str, role_pids: Sequence[int], train_envs: Se
                     wandb_project: str="UnstableBaselines",
                     run_name_suffix: Optional[str]=None,
                     env_step_reward_scale: float=1.0,
+                    include_final_reward: bool=True,
+                    include_invalid_move_reward: bool=True,
+                    balanced_phases: Optional[Sequence[str]]=None,
+                    phase_local_normalization: bool=False,
+                    phase_loss_weights: Optional[dict]=None,
                     initial_step: int=1,
+                    initial_samples_seen: Optional[dict]=None,
+                    initial_training_state_path: Optional[str]=None,
                     wandb_id: Optional[str]=None,
                     wandb_resume: Optional[str]=None,
                     run_name_override: Optional[str]=None):
@@ -107,12 +115,21 @@ def build_multirole(*, model_name: str, role_pids: Sequence[int], train_envs: Se
     - One shared learner on a single GPU holds N PEFT LoRAs (one per pid).
     - role_pids defines which pids are trainable. role_lora_cfgs is a Dict[int, dict] of
       LoraConfig kwargs per pid; if a pid is missing, _DEFAULT_LORA_CFG is broadcast.
-    - eval_substitutions = {pid: openrouter_name} swaps that pid's LoRA for an external
-      model during eval games (e.g. {1: "google/gemini-3.1-flash-lite-preview"}).
+    - eval_substitutions = {pid: model_name} swaps that pid's LoRA for an external
+      model during eval games. eval_provider selects "openrouter" or "azure_ai".
     - algorithm: 'reinforce' | 'a2c' | 'ppo' | 'grpo'. 'a2c' and 'ppo' use per-role
       EpisodeBuffers (needed for GAE); 'reinforce' and 'grpo' use per-role StepBuffers.
     """
     assert algorithm in _MULTIROLE_ALGOS, f"algorithm='{algorithm}' not in {list(_MULTIROLE_ALGOS)}"
+    if balanced_phases or phase_local_normalization or phase_loss_weights:
+        assert algorithm == "reinforce", "phase-balanced sampling/loss is currently supported only for multirole REINFORCE"
+    if not include_final_reward:
+        assert algorithm == "reinforce", "disabling final reward is currently supported only for multirole REINFORCE"
+    balanced_phases = tuple(balanced_phases or ())
+    if balanced_phases:
+        assert batch_size % len(balanced_phases) == 0, "batch_size must be divisible by len(balanced_phases)"
+    if balanced_phases and phase_loss_weights:
+        assert set(balanced_phases) == set(phase_loss_weights), "balanced_phases and phase_loss_weights must name the same phases"
     role_pids = list(role_pids)
     role_lora_cfgs = dict(role_lora_cfgs or {})
     for pid in role_pids: role_lora_cfgs.setdefault(pid, _DEFAULT_LORA_CFG)
@@ -147,6 +164,7 @@ def build_multirole(*, model_name: str, role_pids: Sequence[int], train_envs: Se
     # eval substitutions register their OpenRouter names as fixed entries (so update_ratings works)
     team_sampler = unstable.samplers.FixedRoleTeamSampler(
         model_registry=model_registry, role_pids=role_pids, eval_substitutions=eval_substitutions or {},
+        eval_provider=eval_provider,
         shuffle_roles=shuffle_roles,
     )
 
@@ -161,8 +179,11 @@ def build_multirole(*, model_name: str, role_pids: Sequence[int], train_envs: Se
     use_episode = algorithm in _MULTIROLE_EPISODE_ALGOS
     BufferCls = unstable.EpisodeBuffer if use_episode else unstable.StepBuffer
 
-    final_xforms = [] if algorithm == "grpo" else [retra.RoleAdvantageByEnvFormatter()]
-    step_xforms = [retra.RewardForFormat(1.5), retra.PenaltyForInvalidMove(1.0, -1.0), retra.EnvStepReward(env_step_reward_scale)]
+    final_xforms = [] if algorithm == "grpo" or not include_final_reward else [retra.RoleAdvantageByEnvFormatter()]
+    step_xforms = [retra.RewardForFormat(1.5)]
+    if include_invalid_move_reward:
+        step_xforms.append(retra.PenaltyForInvalidMove(1.0, -1.0))
+    step_xforms.append(retra.EnvStepReward(env_step_reward_scale))
     if env_step_reward_scale != 0.0 and not use_turn_scores:
         import warnings
         warnings.warn(
@@ -177,7 +198,7 @@ def build_multirole(*, model_name: str, role_pids: Sequence[int], train_envs: Se
     if algorithm == "grpo":
         sampling_xforms = []
     else:
-        sampling_xforms = [retra.NormalizeRewardsByEnv(True)]
+        sampling_xforms = [retra.NormalizeRewardsByEnvPhase()] if phase_local_normalization else [retra.NormalizeRewardsByEnv(True)]
         if normalize_adv_by_pid:
             sampling_xforms.append(retra.NormalizeAdvantagesByPidEnv(z_score=True))
 
@@ -192,7 +213,12 @@ def build_multirole(*, model_name: str, role_pids: Sequence[int], train_envs: Se
             sampling_reward_transformation=retra.ComposeSamplingRewardTransforms(sampling_xforms),
         )
         # StepBuffer accepts role_pid for per-role log-file suffixing; EpisodeBuffer does not.
-        if not use_episode: buffer_kwargs["role_pid"] = pid
+        if not use_episode:
+            buffer_kwargs.update(
+                role_pid=pid,
+                include_final_reward=include_final_reward,
+                balanced_phases=balanced_phases,
+            )
         buffers[pid] = BufferCls.options(name=f"Buffer-role-{pid}").remote(**buffer_kwargs)
 
     LearnerCls = _MULTIROLE_ALGOS[algorithm]
@@ -203,12 +229,15 @@ def build_multirole(*, model_name: str, role_pids: Sequence[int], train_envs: Se
         activation_checkpointing=activation_checkpointing, gradient_checkpointing=gradient_checkpointing,
         use_trainer_cache=use_trainer_cache, initial_lora_paths=initial_lora_paths,
         initial_step=initial_step,
+        initial_samples_seen=initial_samples_seen,
+        initial_training_state_path=initial_training_state_path,
     )
 
     match algorithm:
         case "reinforce":
             ray.get(learner.initialize_algorithm.remote(
-                max_train_len=max_train_len, max_generation_len=max_generation_len))
+                max_train_len=max_train_len, max_generation_len=max_generation_len,
+                phase_loss_weights=phase_loss_weights))
         case "a2c":
             ray.get(learner.initialize_algorithm.remote(
                 max_train_len=max_train_len, max_generation_len=max_generation_len,

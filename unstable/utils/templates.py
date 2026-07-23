@@ -35,20 +35,34 @@ def apply_template(template_name: str, observation: str) -> str:
 
 
 def extract_action_and_format_feedback(raw_action: str) -> Tuple[str, Dict[str, bool]]:
-    matches = re.findall(r"\\boxed\{(.*?)\}", raw_action)
-    if matches:
-        last_match = matches[-1].strip()
-        if last_match:  # non-empty boxed
-            action = f"[{last_match}]" if "[" not in last_match else last_match
-            has_think = 1
-        else:  # empty boxed
-            action = raw_action
-            has_think = 0
-    else:  # no boxed at all
-        action = raw_action
-        has_think = 0
+    """Extract the final ``\\boxed{...}`` payload without changing its syntax.
 
-    format_feedback = {"correct_answer_format": bool(has_think)}
+    Game phases use distinct payload delimiters: ``{message}`` for communication,
+    ``<prediction>`` for prediction, and ``[action]`` for decisions.  The old
+    regex stopped at the first closing brace and then added square brackets,
+    corrupting a valid communication payload such as ``\\boxed{{hello}}``.
+    """
+    payloads = []
+    marker = r"\boxed{"
+    start = 0
+    while (box_start := raw_action.find(marker, start)) != -1:
+        payload_start = box_start + len(marker)
+        depth, pos = 1, payload_start
+        while pos < len(raw_action) and depth:
+            if raw_action[pos] == "{": depth += 1
+            elif raw_action[pos] == "}": depth -= 1
+            pos += 1
+        if depth == 0:
+            payloads.append(raw_action[payload_start:pos - 1].strip())
+            start = pos
+        else:
+            start = payload_start
+
+    payload = payloads[-1] if payloads else ""
+    # Preserve phase delimiters exactly.  Keep the historical bracket fallback
+    # for legacy games whose boxed payload is an un-delimited action string.
+    action = payload if payload[:1] in {"{", "<", "["} else (f"[{payload}]" if payload else raw_action)
+    format_feedback = {"correct_answer_format": bool(payload)}
     return action, format_feedback
 
 

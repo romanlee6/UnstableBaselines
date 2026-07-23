@@ -466,6 +466,9 @@ register_with_versions(id="PublicGoodsGame-v0", entry_point="textarena.envs.Publ
 # PublicGoodsGame-Predict: private prediction phase (predict aggregate pool) + per-round payoff and
 # prediction bonus emitted as per-step env reward (state.step_info["step_rewards_by_pid"]).
 register_with_versions(id="PublicGoodsGame-Predict-v0", entry_point="textarena.envs.PublicGoodsGame.env:PublicGoodsGameEnv", wrappers={"default": DEFAULT_WRAPPERS, "-train": [GameMessagesObservationWrapper, ActionFormattingWrapper]}, num_rounds=3, communication_turns=3, endowment=20, multiplication_factor=1.5, num_players=3, enable_prediction=True, use_step_rewards=True, prediction_reward=1.0)
+# PublicGoodsGame-Broadcast: simultaneous {msg} broadcast is native to PGG; this variant just emits
+# per-round payoff via step_rewards_by_pid (no prediction phase).
+register_with_versions(id="PublicGoodsGame-Broadcast-v0", entry_point="textarena.envs.PublicGoodsGame.env:PublicGoodsGameEnv", wrappers={"default": DEFAULT_WRAPPERS, "-train": [GameMessagesObservationWrapper, ActionFormattingWrapper]}, num_rounds=3, communication_turns=3, endowment=20, multiplication_factor=1.5, num_players=2, enable_prediction=False, use_step_rewards=True, prediction_reward=0.0)
 
 # Market Entry Game [Multiple Players]
 register_with_versions(id="MarketEntryGame-v0", entry_point="textarena.envs.MarketEntryGame.env:MarketEntryGameEnv", wrappers={"default": DEFAULT_WRAPPERS, "-train": [GameMessagesObservationWrapper, ActionFormattingWrapper]}, num_rounds=5, communication_turns=3, market_capacity=2, entry_profit=15, overcrowding_penalty=-5, safe_payoff=5, default_num_players=4)

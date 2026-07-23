@@ -12,7 +12,11 @@ class BaseTracker:
         self._build_output_dir()
 
     def _build_output_dir(self):
-        self.output_dir = os.path.join("outputs", str(datetime.datetime.now().strftime('%Y-%m-%d')), str(datetime.datetime.now().strftime('%H-%M-%S')), self.run_name)
+        # Large training artifacts should not have to live in the (quota-limited)
+        # repository checkout.  Keep the historical location as the default, but
+        # let batch jobs point all run output at scratch or pool.
+        output_root = os.path.expanduser(os.environ.get("UNSTABLE_OUTPUT_ROOT", "outputs"))
+        self.output_dir = os.path.join(output_root, str(datetime.datetime.now().strftime('%Y-%m-%d')), str(datetime.datetime.now().strftime('%H-%M-%S')), self.run_name)
         os.makedirs(self.output_dir)
         self.output_dirs = {}
         for folder_name in ["training_data", "eval_data", "checkpoints", "logs"]: 
@@ -43,6 +47,7 @@ class Tracker(BaseTracker):
         self._m: Dict[str, collections.deque] = collections.defaultdict(lambda: collections.deque(maxlen=512))
         self._buffer: Dict[str, Scalar] = {}
         self._n = {}
+        self._phase_n = collections.Counter()
         self._last_flush = time.monotonic()
         self._interface_stats = {"gpu_tok_s": {}, "TS": {}, "exploration": {}, "match_counts": {}, "format_success": None, "inv_move_rate": None, "game_len": None}
 
@@ -64,10 +69,36 @@ class Tracker(BaseTracker):
             self._put(f"collection-{env_id}/Draw", int(reward==0))
             self._put(f"collection-{env_id}/Reward (pid={traj.pid})", reward)
             self._put(f"collection-{env_id}/Game Length", traj.num_turns)
+            metric_role = traj.role_pid if traj.role_pid is not None else traj.pid
             for idx in range(len(traj.obs)):
+                phase = traj.step_phases[idx] if idx < len(traj.step_phases) else "unknown"
+                feedback = traj.format_feedbacks[idx]
                 self._put(f"collection-{env_id}/Respone Length (char)", len(traj.actions[idx]))
                 self._put(f"collection-{env_id}/Observation Length (char)", len(traj.obs[idx]))
-                for k, v in traj.format_feedbacks[idx].items(): self._put(f"collection-{env_id}/Format Success Rate - {k}", v)
+                for k, v in feedback.items(): self._put(f"collection-{env_id}/Format Success Rate - {k}", v)
+                outer = bool(feedback.get("correct_answer_format"))
+                payload = bool(feedback.get("phase_format_valid", True))
+                phase_prefix = f"collection-{env_id}/role-{metric_role}/phase/{phase}"
+                phase_count_key = (env_id, metric_role, phase)
+                self._phase_n[phase_count_key] += 1
+                self._buffer[f"{phase_prefix}/samples"] = self._phase_n[phase_count_key]
+                self._put(f"{phase_prefix}/format/outer", outer)
+                self._put(f"{phase_prefix}/format/payload", payload)
+                self._put(f"{phase_prefix}/format/joint", outer and payload)
+                self._put(f"{phase_prefix}/invalid_move", bool(feedback.get("invalid_move")))
+                env_reward = float(traj.step_rewards[idx]) if idx < len(traj.step_rewards) else 0.0
+                self._put(f"{phase_prefix}/environment_reward", env_reward)
+                action = traj.extracted_actions[idx] if idx < len(traj.extracted_actions) else ""
+                if phase == "prediction":
+                    self._put(f"{phase_prefix}/accuracy", env_reward > 0)
+                if phase == "decision":
+                    cooperate = "[cooperate]" in action.lower()
+                    defect = "[defect]" in action.lower()
+                    self._put(f"{phase_prefix}/cooperate", cooperate and not defect)
+                    self._put(f"{phase_prefix}/defect", defect and not cooperate)
+                    info = traj.step_infos[idx] if idx < len(traj.step_infos) else {}
+                    if "mutual_cooperation" in info:
+                        self._put(f"{phase_prefix}/mutual_cooperation", bool(info["mutual_cooperation"]))
             self._n[f"collection-{env_id}"] = self._n.get(f"collection-{env_id}", 0) + 1
             self._put(f"collection-{env_id}/step", self._n[f"collection-{env_id}"])
             self._buffer.update(self._agg('collection-')); self._flush_if_due()
@@ -109,6 +140,16 @@ class Tracker(BaseTracker):
             self._buffer.update(self._agg("learner")); self._flush_if_due()
         except Exception as exc:
             self.logger.info(f"Exception in log_learner: {exc}")
+
+    def log_buffer(self, info: dict):
+        try:
+            role = info.get("role_pid", "unknown")
+            self._buffer[f"buffer/role-{role}/total"] = info.get("total", 0)
+            for phase, count in info.get("phase_counts", {}).items():
+                self._buffer[f"buffer/role-{role}/phase/{phase}"] = count
+            self._flush_if_due()
+        except Exception as exc:
+            self.logger.info(f"Exception in log_buffer: {exc}")
 
     def get_interface_info(self): 
         for inf_key in ["Game Length", "Format Success Rate - correct_answer_format", "Format Success Rate - invalid_move"]: 

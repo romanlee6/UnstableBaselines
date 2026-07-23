@@ -28,11 +28,13 @@ class FixedRoleTeamSampler:
         model_registry,
         role_pids: List[int],
         eval_substitutions: Optional[Dict[int, str]] = None,
+        eval_provider: str = "openrouter",
         shuffle_roles: bool = True,
     ):
         self.model_registry = model_registry
         self.role_pids = list(role_pids)
         self.eval_substitutions = dict(eval_substitutions or {})
+        self.eval_provider = eval_provider
         self.shuffle_roles = shuffle_roles
 
         # ensure each OpenRouter substitute exists as a fixed entry so rating updates work
@@ -71,10 +73,11 @@ class FixedRoleTeamSampler:
             if pid in self.eval_substitutions:
                 openrouter_name = self.eval_substitutions[pid]
                 agent_specs.append(AgentSpec(
-                    pid=pid, kind="openrouter", lora_path=None, openrouter_name=openrouter_name,
+                    pid=pid, kind=self.eval_provider, lora_path=None, openrouter_name=openrouter_name,
+                    external_provider=self.eval_provider,
                     model_uid=f"fixed-{openrouter_name}",
                 ))
-                models.append({"uid": f"fixed-{openrouter_name}", "pid": pid, "type": "opponent", "role_pid": pid, "source": "openrouter"})
+                models.append({"uid": f"fixed-{openrouter_name}", "pid": pid, "type": "opponent", "role_pid": pid, "source": self.eval_provider})
             else:
                 assert pid in self.role_pids, f"pid {pid} not assigned to any role and not substituted"
                 uid, lora_path = self._ckpt_for_role(pid)

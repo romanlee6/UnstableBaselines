@@ -34,17 +34,18 @@ run = unstable.build_multirole(
     role_lora_cfgs={0: ROLE_LORA_CFG, 1: ROLE_LORA_CFG},
     shuffle_roles=False,
     train_envs=[
-        unstable.TrainEnvSpec(env_id="IteratedPrisonersDilemma-Broadcast-v0-train", num_players=2, num_actors=2, prompt_template="qwen3-zs"),
+        unstable.TrainEnvSpec(env_id="PublicGoodsGame-Broadcast-v0-train", num_players=2, num_actors=2, prompt_template="qwen3-zs"),
     ],
     eval_envs=[
         unstable.EvalEnvSpec(env_id="IteratedPrisonersDilemma-Broadcast-v0-train", num_players=2, prompt_template="qwen3-zs", fixed_opponent="google/gemini-3.1-flash-lite-preview-20260303"),
+        unstable.EvalEnvSpec(env_id="PublicGoodsGame-Broadcast-v0-train", num_players=2, prompt_template="qwen3-zs", fixed_opponent="google/gemini-3.1-flash-lite-preview-20260303"),
     ],
     eval_substitutions={1: "google/gemini-3.1-flash-lite-preview-20260303"},
     algorithm="reinforce",
     max_train_len=MAX_TRAIN_SEQ_LEN,
     max_generation_len=MAX_GENERATION_LENGTH,
     batch_size=384,
-    mini_batch_size=1,
+    mini_batch_size=4,
     buffer_size=384 * 2,
     learning_rate=1e-5,
     gradient_clipping=0.2,
@@ -55,6 +56,5 @@ run = unstable.build_multirole(
     run_name_suffix="noshuffle",
 )
 
-# 1 learner GPU + 2+ collector GPUs. Set CUDA_VISIBLE_DEVICES before launching;
-# Ray auto-assigns the learner one GPU and the collector spawns one vLLM actor per remaining GPU.
-run.start(learning_steps=200, num_collection_workers=128, num_eval_workers=8)
+
+run.start(learning_steps=400, num_collection_workers=384, num_eval_workers=16)

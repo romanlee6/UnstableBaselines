@@ -2,7 +2,7 @@
 
 Exercises:
   - prediction phase with private prompts (aggregate pool prediction)
-  - per-round payoff + prediction bonus written to state.step_info["step_rewards_by_pid"]
+  - decision payoff and prediction bonus emitted as separate reward payloads
 """
 import textarena as ta
 from textarena.core import ObservationType
@@ -48,7 +48,9 @@ def test_pgg_predict():
 
     # The final decision step is the one that triggers resolution
     assert "step_rewards_by_pid" in step_info_final, f"missing step_rewards_by_pid: {step_info_final}"
+    assert "prediction_rewards_by_pid" in step_info_final, f"missing prediction rewards: {step_info_final}"
     srp = step_info_final["step_rewards_by_pid"]
+    prp = step_info_final["prediction_rewards_by_pid"]
     assert set(srp.keys()) == {0, 1, 2}
 
     # Compute expected payoffs:
@@ -58,9 +60,10 @@ def test_pgg_predict():
     #   pid 0 predicted 30 → error 0 → +1.0
     #   pid 1 predicted 15 → error 15 → +(1 - 15/20) = +0.25
     #   pid 2 predicted 15 → error 15 → +0.25
-    expected = {0: 25.0 + 1.0, 1: 25.0 + 0.25, 2: 25.0 + 0.25}
+    expected = {0: 25.0, 1: 25.0, 2: 25.0}
     for pid, v in expected.items():
         assert abs(srp[pid] - v) < 1e-6, f"pid {pid} expected {v}, got {srp[pid]}"
+    assert prp == {0: 1.0, 1: 0.25, 2: 0.25}, prp
 
 
 if __name__ == "__main__":

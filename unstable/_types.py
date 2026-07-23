@@ -15,6 +15,8 @@ class Step:
     role_pid: Optional[int] = None
     own_model_uid: Optional[str] = None
     opponent_model_uids: Tuple[str, ...] = ()
+    phase: Optional[str] = None
+    reward_components: Dict[str, float] = field(default_factory=dict)
 
 @dataclass
 class PlayerTrajectory:
@@ -26,6 +28,7 @@ class PlayerTrajectory:
     format_feedbacks:   List[Dict] = field(default_factory=list)
     step_infos:         List[Dict] = field(default_factory=list)
     step_rewards:       List[float] = field(default_factory=list)
+    step_phases:        List[Optional[str]] = field(default_factory=list)
     game_info:          Dict = field(default_factory=dict)
     num_turns:          int = field(default_factory=int)
     role_pid:           Optional[int] = None
@@ -60,6 +63,7 @@ class AgentSpec:
     action_extraction_fn: str = "default"
     role_pid: int|None = None # multi-role: identifies which role's LoRA/buffer this seat belongs to; may differ from env pid when the sampler shuffles seat↔role.
     model_uid: str|None = None # checkpoint uid or "fixed-<name>" for this seat; carried onto PlayerTrajectory/Step so learners can group by (env, role, own_ckpt, opp_ckpts).
+    external_provider: str|None = None # provider used when openrouter_name names an external fixed opponent
 
 @dataclass
 class GameSpec:
@@ -125,5 +129,3 @@ class TeamSpec:
         for r in self.roles:
             if r.pid == pid: return r
         raise KeyError(f"no role for pid={pid}")
-
-
