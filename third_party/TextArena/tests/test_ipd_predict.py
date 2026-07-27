@@ -19,9 +19,11 @@ def test_ipd_predict():
     env.reset(num_players=2, seed=0)
 
     # Round 1, conversation turn 1 (communication_turns=1 in registration)
-    pid, _ = env.get_observation()
+    pid, obs = env.get_observation()
     assert pid == 0
-    env.step("some private reasoning {let's cooperate}")
+    assert "CURRENT PHASE: CONVERSATION (round 1)" in obs
+    assert "REQUIRED OUTPUT: Reply with exactly one command: [Message:" in obs
+    env.step("[Message: let's cooperate]")
 
     # After pid 0 speaks, pid 1 must NOT see pid 0's public message yet
     p1_before = "\n".join(_obs_texts(env, 1))
@@ -29,7 +31,7 @@ def test_ipd_predict():
 
     pid, _ = env.get_observation()
     assert pid == 1
-    env.step("{ok, cooperating}")
+    env.step("[Message: ok, cooperating]")
 
     # After both submit, both should see the aggregated broadcast
     p0_after = "\n".join(_obs_texts(env, 0))
@@ -41,12 +43,13 @@ def test_ipd_predict():
     assert env.state.game_state["phase"] == "prediction"
 
     # Prediction turn — pid 0 predicts pid 1 will cooperate
-    pid, _ = env.get_observation()
+    pid, obs = env.get_observation()
     assert pid == 0
-    env.step("<Cooperate>")
+    assert "CURRENT PHASE: PREDICTION (round 1)" in obs
+    env.step("[Prediction: Cooperate]")
 
     # pid 1 should NOT see any PLAYER_ACTION from pid 0 during the prediction phase.
-    # (The prediction PROMPT to pid 1 may mention "<Cooperate>" as an example — that's
+    # (The prediction PROMPT to pid 1 may mention "Cooperate" as an example — that's
     # a GAME_BOARD message, not a leak of pid 0's chosen prediction.)
     from textarena.core import ObservationType
     leaks = [(frm, msg) for (frm, msg, typ) in env.state.observations[1]
@@ -55,19 +58,20 @@ def test_ipd_predict():
     # And pid 0's own action IS echoed back to pid 0 (own PLAYER_ACTION):
     p0_actions = [msg for (frm, msg, typ) in env.state.observations[0]
                   if typ == ObservationType.PLAYER_ACTION and frm == 0]
-    assert any("<Cooperate>" in m for m in p0_actions)
+    assert any("[Prediction: Cooperate]" in m for m in p0_actions)
 
     pid, _ = env.get_observation()
     assert pid == 1
-    env.step("<Defect>")   # pid 1 predicts pid 0 will defect (wrong)
+    env.step("[Prediction: Defect]")   # pid 1 predicts pid 0 will defect (wrong)
 
     assert env.state.game_state["phase"] == "decision"
 
     # Decision turn — both cooperate
+    pid, obs = env.get_observation()
+    assert "CURRENT PHASE: DECISION (round 1)" in obs
+    env.step("[Action: Cooperate]")
     pid, _ = env.get_observation()
-    env.step("[Cooperate]")
-    pid, _ = env.get_observation()
-    done, step_info = env.step("[Cooperate]")
+    done, step_info = env.step("[Action: Cooperate]")
 
     # This is the step that triggered resolution — payoffs go to decision steps,
     # while prediction bonuses are separately routed to prediction steps by UB.
@@ -89,7 +93,10 @@ def test_ipd_predict_retry_still_resolves_shaped_rewards():
     env.state.error_allowance = 2
 
     # Finish simultaneous communication and prediction.
-    for action in ("{cooperate}", "{cooperate}", "<Cooperate>", "<Cooperate>"):
+    for action in (
+        "[Message: cooperate]", "[Message: cooperate]",
+        "[Prediction: Cooperate]", "[Prediction: Cooperate]",
+    ):
         done, _ = env.step(action)
         assert not done
 
@@ -97,14 +104,54 @@ def test_ipd_predict_retry_still_resolves_shaped_rewards():
     done, info = env.step("not a valid decision")
     assert not done
     assert info["phase_format_valid_by_pid"] == {0: False}
-    done, _ = env.step("[Cooperate]")
+    done, _ = env.step("[Action: Cooperate]")
     assert not done
-    done, info = env.step("[Cooperate]")
+    done, info = env.step("[Action: Cooperate]")
     assert not done
     assert info["step_rewards_by_pid"] == {0: 3.0, 1: 3.0}
     assert info["prediction_rewards_by_pid"] == {0: 1.0, 1: 1.0}
 
 
+def test_round2_decision_observation_preserves_round1_history():
+    """The conversational wrapper should expose all history delivered to the player."""
+    env = ta.make("IteratedPrisonersDilemma-Predict-v0-train")
+    env.reset(num_players=2, seed=0)
+
+    round1 = (
+        "[Message: round-one-p0]", "[Message: round-one-p1]",
+        "[Prediction: Cooperate]", "[Prediction: Cooperate]",
+        "[Action: Cooperate]", "[Action: Cooperate]",
+    )
+    for action in round1:
+        pid, _ = env.get_observation()
+        done, _ = env.step(action)
+        assert not done
+
+    round2_before_p1_decision = (
+        "[Message: round-two-p0]", "[Message: round-two-p1]",
+        "[Prediction: Cooperate]", "[Prediction: Cooperate]",
+        "[Action: Cooperate]",
+    )
+    for action in round2_before_p1_decision:
+        pid, _ = env.get_observation()
+        done, _ = env.step(action)
+        assert not done
+
+    pid, obs = env.get_observation()
+    assert pid == 1
+    assert "round-one-p0" in obs
+    assert "round-one-p1" in obs
+    assert "Round 1 results:" in obs
+    assert "Both players cooperated." in obs
+    assert "--- Starting Round 2 ---" in obs
+    assert "round-two-p0" in obs
+    assert "round-two-p1" in obs
+    assert "CURRENT PHASE: DECISION (round 2)" in obs
+    assert "REQUIRED OUTPUT: Reply with exactly one command: [Action: Cooperate]" in obs
+
+
 if __name__ == "__main__":
     test_ipd_predict()
+    test_ipd_predict_retry_still_resolves_shaped_rewards()
+    test_round2_decision_observation_preserves_round1_history()
     print("OK")

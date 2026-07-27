@@ -1,4 +1,5 @@
 import os, ray, torch, time, pathlib
+from collections import defaultdict
 from typing import List, Dict, Any, Optional
 
 from unstable.buffers import BaseBuffer
@@ -22,13 +23,17 @@ class MultiRoleBaseLearner:
                  activation_checkpointing: bool=True, gradient_checkpointing: bool=True,
                  use_trainer_cache: bool=False, initial_lora_paths: Optional[Dict[int, str]]=None,
                  initial_step: int=1, initial_samples_seen: Optional[Dict[int, int]]=None,
-                 initial_training_state_path: Optional[str]=None):
+                 initial_training_state_path: Optional[str]=None,
+                 max_oom_retries: int=3):
         self.model_name, self.role_lora_cfgs = model_name, role_lora_cfgs
         self.buffers, self.tracker, self.model_registry = buffers, tracker, model_registry
         self.logger = setup_logger("multirole_learner", ray.get(tracker.get_log_dir.remote()))
         self.use_trainer_cache, self.gradient_checkpointing, self.activation_checkpointing = use_trainer_cache, gradient_checkpointing, activation_checkpointing
         self.batch_size, self.mini_batch_size, self.lr, self.grad_clip = batch_size, mini_batch_size, learning_rate, grad_clip
         self.gradient_acc_steps = self.batch_size // self.mini_batch_size
+        if max_oom_retries < 0:
+            raise ValueError("max_oom_retries must be non-negative")
+        self.max_oom_retries = max_oom_retries
         self.ckpt_dir = pathlib.Path(ray.get(self.tracker.get_checkpoints_dir.remote())); self.ckpt_dir.mkdir(parents=True, exist_ok=True)
 
         torch.set_float32_matmul_precision('high')
@@ -71,46 +76,101 @@ class MultiRoleBaseLearner:
     def initialize_algorithm(self, *args, **kwargs): raise NotImplementedError
     def _update(self, role_pid: int, batch):         raise NotImplementedError
 
-    def _ready_roles(self) -> List[int]:
+    def _ready_roles(self, candidates: Optional[List[int]]=None) -> List[int]:
         ready = []
-        for pid in self.role_pids:
+        for pid in self.role_pids if candidates is None else candidates:
             if ray.get(self.buffers[pid].ready_for_batch.remote(self.batch_size)):
                 ready.append(pid)
         return ready
 
+    def _clear_failed_update(self) -> None:
+        """Discard partial gradients and release cached CUDA blocks after an OOM."""
+        for optimizer in self.policy_optimizers.values():
+            optimizer.zero_grad(set_to_none=True)
+        for optimizer in getattr(self, "critic_optimizers", {}).values():
+            optimizer.zero_grad(set_to_none=True)
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
     def train(self, iterations: int):
         self._restore_training_state()
         self.logger.info(f"Starting multi-role training loop over roles={self.role_pids}")
+        completed_roles = set()
+        pending_batches = {}
+        oom_retries = defaultdict(int)
         while self._step < iterations:
-            try:
-                while not self._ready_roles(): time.sleep(0.2)
-                ready = self._ready_roles()
-                self.logger.info(f"step {self._step}: ready roles = {ready}")
-                for pid in ready:
+            remaining_roles = [
+                pid for pid in self.role_pids if pid not in completed_roles
+            ]
+            ready = [
+                pid for pid in remaining_roles if pid in pending_batches
+            ]
+            uncached_roles = [
+                pid for pid in remaining_roles if pid not in pending_batches
+            ]
+            ready.extend(self._ready_roles(uncached_roles))
+            if not ready:
+                time.sleep(0.2)
+                continue
+
+            self.logger.info(
+                f"step {self._step}: ready roles = {ready}; "
+                f"completed roles = {sorted(completed_roles)}"
+            )
+            for pid in ready:
+                if pid not in pending_batches:
                     batch: List = ray.get(self.buffers[pid].get_batch.remote(self.batch_size))
-                    self._samples_seen[pid] += self.batch_size
+                    pending_batches[pid] = batch
+                batch = pending_batches[pid]
+
+                try:
                     metrics = self._update(role_pid=pid, batch=batch)
+                except torch.OutOfMemoryError as exc:
+                    self._clear_failed_update()
+                    oom_retries[pid] += 1
+                    if oom_retries[pid] > self.max_oom_retries:
+                        raise RuntimeError(
+                            f"role-{pid} step {self._step} exhausted "
+                            f"{self.max_oom_retries} CUDA OOM retries on the same batch "
+                            f"with mini_batch_size={self.mini_batch_size}"
+                        ) from exc
+                    self.logger.warning(
+                        f"role-{pid} step {self._step} CUDA OOM; retaining the same "
+                        f"batch and retrying at mini_batch_size={self.mini_batch_size} "
+                        f"({oom_retries[pid]}/{self.max_oom_retries})"
+                    )
+                    continue
 
-                    opt = self.policy_optimizers[pid]
-                    grad_norm = sum(p.grad.data.norm(2).item()**2 for p in opt.param_groups[0]['params'] if p.grad is not None) ** 0.5
-                    log = {f"role-{pid}/{k}": v for k, v in metrics.items()}
-                    log.update({"step": self._step, f"role-{pid}/samples_seen": self._samples_seen[pid], f"role-{pid}/lr": opt.param_groups[0]["lr"], f"role-{pid}/grad_norm": grad_norm})
-                    self.tracker.log_learner.remote(log)
+                # The optimizer step committed successfully. Only now count the
+                # samples and permit this role to be checkpointed for the step.
+                self._samples_seen[pid] += self.batch_size
+                oom_retries.pop(pid, None)
 
-                    ckpt_path = self._save_checkpoint(pid)
-                    try:
-                        self.model_registry.add_checkpoint.remote(uid=f"ckpt-role{pid}-{self._step}", path=str(ckpt_path), iteration=self._step, role_pid=pid)
-                        self.logger.info(f"registered ckpt role-{pid} step {self._step} -> {ckpt_path}")
-                    except Exception as exc: self.logger.info(f"add_checkpoint failed for role-{pid}: {exc}")
+                opt = self.policy_optimizers[pid]
+                grad_norm = sum(p.grad.data.norm(2).item()**2 for p in opt.param_groups[0]['params'] if p.grad is not None) ** 0.5
+                log = {f"role-{pid}/{k}": v for k, v in metrics.items()}
+                log.update({"step": self._step, f"role-{pid}/samples_seen": self._samples_seen[pid], f"role-{pid}/lr": opt.param_groups[0]["lr"], f"role-{pid}/grad_norm": grad_norm})
+                self.tracker.log_learner.remote(log)
 
-                # Only publish resumable state when every role has an adapter for
-                # this iteration. A preemption between role updates therefore
-                # falls back to the preceding complete, internally consistent step.
-                if self._iteration_is_complete():
-                    self._save_training_state()
+                ckpt_path = self._save_checkpoint(pid)
+                try:
+                    self.model_registry.add_checkpoint.remote(uid=f"ckpt-role{pid}-{self._step}", path=str(ckpt_path), iteration=self._step, role_pid=pid)
+                    self.logger.info(f"registered ckpt role-{pid} step {self._step} -> {ckpt_path}")
+                except Exception as exc: self.logger.info(f"add_checkpoint failed for role-{pid}: {exc}")
+                completed_roles.add(pid)
+                pending_batches.pop(pid, None)
+
+            if completed_roles == set(self.role_pids):
+                if not self._iteration_is_complete():
+                    raise RuntimeError(
+                        f"step {self._step} updated every role but its checkpoint "
+                        "directory is incomplete"
+                    )
+                self._save_training_state()
                 self._step += 1
-            except Exception as exc:
-                self.logger.exception(f"Exception in multirole learner loop: {exc}")
+                completed_roles.clear()
+                pending_batches.clear()
+                oom_retries.clear()
 
         self.logger.info("[MultiRoleLearner] training finished.")
         for pid in self.role_pids: self.buffers[pid].stop.remote()

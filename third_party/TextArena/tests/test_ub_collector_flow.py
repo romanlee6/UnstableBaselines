@@ -12,7 +12,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))) +
 import textarena as ta
 from unstable._types import PlayerTrajectory
 from unstable.reward_transformations.transformation_step import EnvStepReward, RewardForFormat
-from unstable.utils.templates import extract_action_and_format_feedback
+from unstable.utils.templates import apply_template, extract_action_and_format_feedback
 
 
 def _apply_env_rewards(trajs, step_info):
@@ -53,8 +53,8 @@ def run_scripted_game(env_id: str, actions_by_pid: dict, num_players: int):
 def test_ipd_predict_collector_flow():
     # scripted 1-round IPD: both cooperate; pid 0 predicts C (correct), pid 1 predicts D (wrong)
     actions = {
-        0: ["{cooperate}", "<Cooperate>", "[Cooperate]"],  # comm, pred, decision
-        1: ["{cooperate}", "<Defect>",    "[Cooperate]"],
+        0: ["[Message: cooperate]", "[Prediction: Cooperate]", "[Action: Cooperate]"],
+        1: ["[Message: cooperate]", "[Prediction: Defect]",    "[Action: Cooperate]"],
     }
     # IPD-Predict-v0 default num_rounds=10 comm_turns=1 — but we only script 1 round.
     # To keep the game short, monkey-patch num_rounds down after reset via game_state.
@@ -99,6 +99,9 @@ def test_boxed_payload_is_preserved():
     assert extract_action_and_format_feedback(r"\boxed{{hello}}") == ("{hello}", {"correct_answer_format": True})
     assert extract_action_and_format_feedback(r"\boxed{<Cooperate>}") == ("<Cooperate>", {"correct_answer_format": True})
     assert extract_action_and_format_feedback(r"\boxed{[Cooperate]}") == ("[Cooperate]", {"correct_answer_format": True})
+    assert extract_action_and_format_feedback(
+        r"\boxed{[Prediction: Cooperate]}"
+    ) == ("[Prediction: Cooperate]", {"correct_answer_format": True})
     traj = PlayerTrajectory(format_feedbacks=[
         {"correct_answer_format": True, "phase_format_valid": True},
         {"correct_answer_format": True, "phase_format_valid": False},
@@ -108,7 +111,20 @@ def test_boxed_payload_is_preserved():
     assert xform(traj, 1, 0.0) == 0.0
 
 
+def test_multiphase_template_treats_required_output_as_boxed_payload():
+    prompt = apply_template(
+        "qwen3-multiphase",
+        "CURRENT PHASE: DECISION (round 1).\n"
+        "REQUIRED OUTPUT: Reply with exactly one command: "
+        "[Action: Cooperate] or [Action: Defect]",
+    )
+    assert "REQUIRED OUTPUT describes only that payload" in prompt
+    assert r"\boxed{[Action: Cooperate]}" in prompt
+    assert "Never emit the command bare" in prompt
+
+
 if __name__ == "__main__":
     test_ipd_predict_collector_flow()
     test_boxed_payload_is_preserved()
+    test_multiphase_template_treats_required_output_as_boxed_payload()
     print("OK")

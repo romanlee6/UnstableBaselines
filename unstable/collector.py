@@ -37,9 +37,11 @@ class CallableActorWrapper:
 
     def act_full(self, observation: str) -> Tuple[str, str, str, dict]:
         prompt = self._fmt(observation=observation)
-        raw = ray.get(self._actor.submit_prompt.remote(prompt=prompt, lora_path=self._lora))
+        raw, effective_prompt = ray.get(
+            self._actor.submit_prompt.remote(prompt=prompt, lora_path=self._lora)
+        )
         extracted, format_feedback = self._extract(raw_action=raw)
-        return raw, extracted, prompt, format_feedback
+        return raw, extracted, effective_prompt, format_feedback
 
 @ray.remote(num_cpus=0)
 def run_game(game_spec: GameSpec, actor: VLLMActor):
@@ -67,7 +69,11 @@ def run_game(game_spec: GameSpec, actor: VLLMActor):
         game_information.extracted_actions.append(extracted); game_information.step_infos.append(step_info); game_information.names[pid] = agents[pid]["name"]
         # player specific trackering
         if agents[pid]["traj"] != None:
-            agents[pid]["traj"].obs.append(obs); agents[pid]["traj"].actions.append(raw); agents[pid]["traj"].extracted_actions.append(extracted)
+            # Train on the exact formatted prompt used for sampling. Storing the
+            # raw TextArena observation here creates an off-policy mismatch: the
+            # learner would not see the Qwen chat wrapper or \boxed{} instruction
+            # that conditioned the sampled response.
+            agents[pid]["traj"].obs.append(prompt); agents[pid]["traj"].actions.append(raw); agents[pid]["traj"].extracted_actions.append(extracted)
             format_feedback["invalid_move"] = False
             phase_valid = (step_info or {}).get("phase_format_valid_by_pid", {}).get(pid)
             if phase_valid is not None: format_feedback["phase_format_valid"] = bool(phase_valid)

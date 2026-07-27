@@ -3,9 +3,12 @@
 The registered ``IteratedPrisonersDilemma-Predict-v0-train`` environment runs
 three queries per player in each round:
 
-1. simultaneous ``{message}`` communication,
-2. private ``<Cooperate>`` / ``<Defect>`` prediction of the opponent action,
-3. simultaneous ``[Cooperate]`` / ``[Defect]`` decision.
+1. simultaneous ``[Message: ...]`` communication,
+2. private ``[Prediction: Cooperate]`` / ``[Prediction: Defect]`` prediction,
+3. simultaneous ``[Action: Cooperate]`` / ``[Action: Defect]`` decision.
+
+The shared UB prompt still places each command inside ``\\boxed{...}``; the
+environment receives and validates the extracted square-bracket payload.
 
 The collector routes the prediction bonus back to the prediction completion and
 the game payoff to the decision completion. Both role adapters train in
@@ -20,8 +23,8 @@ import unstable
 
 
 MODEL_NAME = "Qwen/Qwen3-4B-Base"
-MAX_TRAIN_SEQ_LEN = 3000
-MAX_GENERATION_LENGTH = 1024
+MAX_TRAIN_SEQ_LEN = int(os.environ.get("UB_MAX_TRAIN_SEQ_LEN", "3000"))
+MAX_GENERATION_LENGTH = int(os.environ.get("UB_MAX_GENERATION_LENGTH", "256"))
 BATCH_SIZE = 384
 AZURE_EVAL_DEPLOYMENT = os.environ.get("AZURE_AI_DEPLOYMENT", "DeepSeek-V4-flash")
 
@@ -144,7 +147,7 @@ run = unstable.build_multirole(
             env_id="IteratedPrisonersDilemma-Predict-v0-train",
             num_players=2,
             num_actors=2,
-            prompt_template="qwen3-zs",
+            prompt_template="qwen3-multiphase",
         ),
     ],
     # Evaluate role 0 against a fixed external opponent; both roles continue
@@ -153,7 +156,7 @@ run = unstable.build_multirole(
         unstable.EvalEnvSpec(
             env_id="IteratedPrisonersDilemma-Predict-v0-train",
             num_players=2,
-            prompt_template="qwen3-zs",
+            prompt_template="qwen3-multiphase",
             fixed_opponent=AZURE_EVAL_DEPLOYMENT,
         ),
     ],
@@ -162,6 +165,7 @@ run = unstable.build_multirole(
     algorithm="reinforce",
     max_train_len=MAX_TRAIN_SEQ_LEN,
     max_generation_len=MAX_GENERATION_LENGTH,
+    retain_recent_context=True,
     batch_size=BATCH_SIZE,
     mini_batch_size=4,
     buffer_size=BATCH_SIZE * 2,

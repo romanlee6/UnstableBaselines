@@ -11,6 +11,19 @@ TEMPLATE_PARTS = {
         "user": lambda obs: f"<|im_start|>user\nYou are playing a two-player zero-sum game. Make valid actions to win.\nObservation: {obs}\nPlease reason step by step, and put your final answer within \\boxed{{}}.<|im_end|>\n",
         "assistant": "<|im_start|>assistant\n"
     },
+    "qwen3-multiphase": {
+        "user": lambda obs: (
+            f"<|im_start|>user\nYou are playing a multi-stage game.\n"
+            f"Observation: {obs}\n"
+            "Use the final CURRENT PHASE and REQUIRED OUTPUT instruction to choose the "
+            "square-bracket command payload. The REQUIRED OUTPUT describes only that payload, "
+            "not the complete response. Reason briefly about this phase only and do not repeat "
+            "the observation. Then return the command wrapped in \\boxed{...}; for example, "
+            "\\boxed{[Action: Cooperate]}. Never emit the command bare, and do not write "
+            "anything after the closing brace.<|im_end|>\n"
+        ),
+        "assistant": "<|im_start|>assistant\n",
+    },
     "qwen3-sp": {
         "user": lambda obs:  f"<|im_start|>user\nYou are playing a single-player game. Make valid actions to solve it completely.\nObservation: {obs}\nPlease reason step by step, and put your final answer within \\boxed{{}}.<|im_end|>\n",
         "assistant": "<|im_start|>assistant\n"
@@ -37,10 +50,9 @@ def apply_template(template_name: str, observation: str) -> str:
 def extract_action_and_format_feedback(raw_action: str) -> Tuple[str, Dict[str, bool]]:
     """Extract the final ``\\boxed{...}`` payload without changing its syntax.
 
-    Game phases use distinct payload delimiters: ``{message}`` for communication,
-    ``<prediction>`` for prediction, and ``[action]`` for decisions.  The old
-    regex stopped at the first closing brace and then added square brackets,
-    corrupting a valid communication payload such as ``\\boxed{{hello}}``.
+    Some games use a square-bracket command payload inside the box, while legacy
+    environments may use braces or angle brackets. The old regex stopped at the
+    first closing brace and then added square brackets, corrupting nested payloads.
     """
     payloads = []
     marker = r"\boxed{"

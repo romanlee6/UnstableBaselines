@@ -18,7 +18,30 @@ _MULTIROLE_ALGOS = {
     "grpo":      unstable.MultiRolePPOLearner,   # adv_estimator='grpo'
 }
 _MULTIROLE_EPISODE_ALGOS = {"a2c", "ppo", "grpo"}   # GAE / turn-level return-to-go -> per-role EpisodeBuffer
-def _default_vllm_cfg(model_name: str, lora_cfg: dict, max_generation_len: int) -> dict: return {"model_name": model_name, "temperature": 0.6, "max_tokens": max_generation_len, "max_parallel_seq": 128, "max_loras": 8, "lora_config": lora_cfg, "max_model_len": 8192}
+def _default_vllm_cfg(
+    model_name: str,
+    lora_cfg: dict,
+    max_generation_len: int,
+    max_train_len: Optional[int] = None,
+    retain_recent_context: bool = False,
+) -> dict:
+    max_model_len = 8192
+    max_prompt_tokens = max_model_len - max_generation_len
+    if retain_recent_context and max_train_len is not None:
+        max_prompt_tokens = min(max_prompt_tokens, max_train_len - max_generation_len)
+    if max_prompt_tokens <= 0:
+        raise ValueError("max_train_len/max_model_len must leave room for generated tokens")
+    return {
+        "model_name": model_name,
+        "temperature": 0.6,
+        "max_tokens": max_generation_len,
+        "max_prompt_tokens": max_prompt_tokens,
+        "prompt_prefix_tokens": 256,
+        "max_parallel_seq": 128,
+        "max_loras": 8,
+        "lora_config": lora_cfg,
+        "max_model_len": max_model_len,
+    }
 
 class _UBRun:
     def __init__(self, *, collector, learner): self.collector, self.learner = collector, learner
@@ -69,7 +92,7 @@ def build(*, model_name: str, train_envs: Sequence[unstable.TrainEnvSpec], eval_
         case _:             ray.get(learner.initialize_algorithm.remote())
 
     # initialize the collector after the learner so it only claims the remaining GPUs for VLLM actors
-    collector = unstable.Collector.options(name="Collector").remote(vllm_config=vllm_config or _default_vllm_cfg(model_name, _lora_cfg, max_generation_len), tracker=tracker, buffer=buffer, game_scheduler=game_scheduler)
+    collector = unstable.Collector.options(name="Collector").remote(vllm_config=vllm_config or _default_vllm_cfg(model_name, _lora_cfg, max_generation_len, max_train_len), tracker=tracker, buffer=buffer, game_scheduler=game_scheduler)
 
     return _UBRun(collector=collector, learner=learner)
 
@@ -107,6 +130,8 @@ def build_multirole(*, model_name: str, role_pids: Sequence[int], train_envs: Se
                     initial_step: int=1,
                     initial_samples_seen: Optional[dict]=None,
                     initial_training_state_path: Optional[str]=None,
+                    max_oom_retries: int=3,
+                    retain_recent_context: bool=False,
                     wandb_id: Optional[str]=None,
                     wandb_resume: Optional[str]=None,
                     run_name_override: Optional[str]=None):
@@ -231,6 +256,7 @@ def build_multirole(*, model_name: str, role_pids: Sequence[int], train_envs: Se
         initial_step=initial_step,
         initial_samples_seen=initial_samples_seen,
         initial_training_state_path=initial_training_state_path,
+        max_oom_retries=max_oom_retries,
     )
 
     match algorithm:
@@ -268,7 +294,10 @@ def build_multirole(*, model_name: str, role_pids: Sequence[int], train_envs: Se
     # use the first role's lora_cfg for the vllm default; vllm supports multiple loras via LoRARequest per inference
     vllm_default_lora = role_lora_cfgs[role_pids[0]]
     collector = unstable.Collector.options(name="Collector").remote(
-        vllm_config=vllm_config or _default_vllm_cfg(model_name, vllm_default_lora, max_generation_len),
+        vllm_config=vllm_config or _default_vllm_cfg(
+            model_name, vllm_default_lora, max_generation_len, max_train_len,
+            retain_recent_context=retain_recent_context,
+        ),
         tracker=tracker, buffer=None, game_scheduler=game_scheduler, buffers=buffers,
     )
 

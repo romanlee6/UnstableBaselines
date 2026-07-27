@@ -3,8 +3,10 @@ from collections import deque
 from typing import Optional, Dict, Any
 
 import ray
+from transformers import AutoTokenizer
 from vllm import AsyncEngineArgs, AsyncLLMEngine, SamplingParams
 from vllm.lora.request import LoRARequest
+from unstable.utils.context_window import recent_prompt_token_ids
 
 from unstable.utils.logging import setup_logger
 
@@ -51,6 +53,19 @@ class VLLMActor:
             top_p=cfg.get("top_p", 0.95),
             max_tokens=cfg.get("max_tokens", 4096),
         )
+        self.max_prompt_tokens = int(
+            cfg.get("max_prompt_tokens", cfg["max_model_len"] - self.sampling_params.max_tokens)
+        )
+        self.prompt_prefix_tokens = int(cfg.get("prompt_prefix_tokens", 256))
+        if self.max_prompt_tokens <= 0:
+            raise ValueError("vLLM max_prompt_tokens must be positive")
+        if self.max_prompt_tokens + self.sampling_params.max_tokens > cfg["max_model_len"]:
+            raise ValueError(
+                "max_prompt_tokens + max_tokens must not exceed max_model_len"
+            )
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            cfg["model_name"], trust_remote_code=True
+        )
 
         self.tracker = tracker
         self.name = name
@@ -83,13 +98,35 @@ class VLLMActor:
             self._next_lora_id += 1
         return LoRARequest(path, self._lora_ids[path], path)
 
-    async def submit_prompt(self, prompt: str, lora_path: Optional[str] = None) -> str:
+    async def submit_prompt(
+        self, prompt: str, lora_path: Optional[str] = None
+    ) -> tuple[str, str]:
         if lora_path is not None and not isinstance(lora_path, str):
             lora_path = str(lora_path)
 
         req_id = str(self._next_id)
         self._next_id += 1
         lora_req = self._lora_request_for(lora_path)
+        prompt_token_ids, dropped = recent_prompt_token_ids(
+            self.tokenizer, prompt, self.max_prompt_tokens, self.prompt_prefix_tokens
+        )
+        if dropped:
+            self.logger.info(
+                f"left-truncated {dropped} old prompt tokens; "
+                f"retained newest {len(prompt_token_ids)} tokens"
+            )
+        effective_prompt = (
+            prompt
+            if not dropped
+            else self.tokenizer.decode(
+                prompt_token_ids,
+                skip_special_tokens=False,
+                clean_up_tokenization_spaces=False,
+            )
+        )
+        tokenized_prompt = {
+            "prompt_token_ids": prompt_token_ids,
+        }
 
         self._queued += 1
         first_token_seen = False
@@ -98,7 +135,7 @@ class VLLMActor:
 
         try:
             async for output in self.engine.generate(
-                prompt, self.sampling_params, req_id, lora_request=lora_req
+                tokenized_prompt, self.sampling_params, req_id, lora_request=lora_req
             ):
                 if not first_token_seen:
                     self._queued -= 1
@@ -121,7 +158,7 @@ class VLLMActor:
             else:
                 self._queued -= 1
 
-        return final_text
+        return final_text, effective_prompt
 
     async def _report_loop(self):
         self.logger.info("Starting _report_loop")

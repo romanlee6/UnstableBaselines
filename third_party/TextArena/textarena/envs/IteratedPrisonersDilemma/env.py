@@ -36,13 +36,18 @@ class IteratedPrisonersDilemmaEnv(ta.Env):
         self.use_step_rewards = use_step_rewards
         self.prediction_reward = prediction_reward
 
-        # action regex
-        self.cooperate_pattern = re.compile(r"\[Cooperate\]", re.IGNORECASE)
-        self.defect_pattern    = re.compile(r"\[Defect\]",    re.IGNORECASE)
-        # {...} for public message payload (PGG-compatible)
-        self.public_message_pattern = re.compile(r"\{([^}]*)\}", re.DOTALL)
-        # <...> for private prediction payload; separate delimiter avoids collision with [action]/{msg}
-        self.prediction_pattern = re.compile(r"<([^>]*)>", re.DOTALL)
+        # One typed square-bracket grammar for every phase. UB may place this
+        # payload inside its shared \boxed{...} answer envelope before it reaches
+        # the environment.
+        self.public_message_pattern = re.compile(
+            r"^\s*\[Message\s*:\s*(.*?)\s*\]\s*$", re.IGNORECASE | re.DOTALL
+        )
+        self.prediction_pattern = re.compile(
+            r"^\s*\[Prediction\s*:\s*(Cooperate|Defect)\s*\]\s*$", re.IGNORECASE
+        )
+        self.decision_pattern = re.compile(
+            r"^\s*\[Action\s*:\s*(Cooperate|Defect)\s*\]\s*$", re.IGNORECASE
+        )
 
     def reset(self, num_players: int, seed: Optional[int] = None):
         self.state = ta.TwoPlayerState(num_players=num_players, seed=seed)
@@ -68,7 +73,7 @@ class IteratedPrisonersDilemmaEnv(ta.Env):
             f"Game Structure:\n"
             f"- Before each decision you have {game_state['total_conversation_rounds']} "
             f"turns to communicate.\n"
-            f"- After that, both players simultaneously choose [Cooperate] or [Defect].\n\n"
+            f"- After that, both players simultaneously choose whether to cooperate or defect.\n\n"
             f"Payoff Matrix (fixed each round):\n"
             f"- Both Cooperate ➜ each {self.cooperate_reward}\n"
             f"- Both Defect ➜ each {self.mutual_defect_reward}\n"
@@ -78,11 +83,10 @@ class IteratedPrisonersDilemmaEnv(ta.Env):
         if self.enable_broadcast_comm:
             comm_block = (
                 f"How to Play:\n"
-                f"- During conversation: send a public message using {{message}} format. "
+                f"- During conversation: send a public message using '[Message: your message]'. "
                 f"Communication is SIMULTANEOUS: both players' messages are revealed only "
-                f"after both submit. Only the text inside {{}} is broadcast; free-text "
-                f"outside {{}} stays private to you.\n"
-                f"  Example: 'I want to build trust. {{Let\\'s both cooperate this round.}}'\n"
+                f"after both submit. Only the message inside the command is broadcast.\n"
+                f"  Example: [Message: Let's both cooperate this round.]\n"
             )
         else:
             comm_block = (
@@ -93,19 +97,36 @@ class IteratedPrisonersDilemmaEnv(ta.Env):
         if self.enable_prediction:
             pred_block = (
                 f"- During prediction phase: privately predict your opponent's next decision as "
-                f"'<Cooperate>' or '<Defect>'. Only the tagged token is scored. A correct "
+                f"'[Prediction: Cooperate]' or '[Prediction: Defect]'. A correct "
                 f"prediction earns +{self.prediction_reward}. This is private to you.\n"
             )
         decision_block = (
-            f"- During decision phase: include '[Cooperate]' or '[Defect]' (case-insensitive). "
-            f"You may add extra text before/after the token.\n\n"
+            f"- During decision phase: submit exactly '[Action: Cooperate]' or "
+            f"'[Action: Defect]' (case-insensitive).\n\n"
             "The payoff matrix will remain the same every round:\n"
             f"- Both Cooperate: {self.cooperate_reward}\n"
             f"- Both Defect: {self.mutual_defect_reward}\n"
             f"- If you Defect while the other Cooperates: {self.defect_reward}\n"
             f"- If you Cooperate while the other Defects: {self.sucker_reward}"
         )
-        return base + comm_block + pred_block + decision_block
+        return base + comm_block + pred_block + decision_block + "\n\n" + self._phase_instruction("conversation")
+
+    def _phase_instruction(self, phase: Optional[str] = None) -> str:
+        """Return a final, unambiguous instruction for the current query."""
+        phase = phase or self.state.game_state["phase"]
+        round_number = self.state.game_state["round"]
+        if phase == "conversation":
+            if self.enable_broadcast_comm:
+                requirement = "Reply with exactly one command: [Message: your public message]"
+            else:
+                requirement = "Reply with the message you want to send."
+        elif phase == "prediction":
+            requirement = "Reply with exactly one command: [Prediction: Cooperate] or [Prediction: Defect]"
+        elif phase == "decision":
+            requirement = "Reply with exactly one command: [Action: Cooperate] or [Action: Defect]"
+        else:
+            raise ValueError(f"Unknown IPD phase: {phase}")
+        return f"CURRENT PHASE: {phase.upper()} (round {round_number}).\nREQUIRED OUTPUT: {requirement}"
 
     def step(self, action: str) -> Tuple[bool, ta.Info]:
         self.state.add_observation(
@@ -142,11 +163,9 @@ class IteratedPrisonersDilemmaEnv(ta.Env):
                 self._exit_conversation_phase()
 
     def _extract_public_message(self, action: str) -> Optional[str]:
-        matches = self.public_message_pattern.findall(action)
-        if matches:
-            valid = [m.strip() for m in matches if m.strip()]
-            if valid:
-                return " ".join(valid)
+        match = self.public_message_pattern.fullmatch(action)
+        if match and match.group(1).strip():
+            return match.group(1).strip()
         return None
 
     def _handle_conversation_broadcast(self, action: str):
@@ -183,9 +202,9 @@ class IteratedPrisonersDilemmaEnv(ta.Env):
                     to_id=pid,
                     from_id=ta.GAME_ID,
                     message=(
-                        f"Prediction phase for round {self.state.game_state['round']} (private). "
-                        f"Predict your opponent's next decision as '<Cooperate>' or '<Defect>'. "
-                        f"Correct predictions earn +{self.prediction_reward}."
+                        f"Prediction phase for round {self.state.game_state['round']} is private. "
+                        f"Correct predictions earn +{self.prediction_reward}.\n"
+                        f"{self._phase_instruction('prediction')}"
                     ),
                     observation_type=ta.ObservationType.GAME_BOARD,
                 )
@@ -193,8 +212,8 @@ class IteratedPrisonersDilemmaEnv(ta.Env):
             self.state.game_state["phase"] = "decision"
             self.state.add_observation(
                 message=(
-                    f"Conversation finished for round {self.state.game_state['round']}. "
-                    f"Please reply with '[Cooperate]' or '[Defect]'."
+                    f"Conversation finished for round {self.state.game_state['round']}.\n"
+                    f"{self._phase_instruction('decision')}"
                 ),
                 observation_type=ta.ObservationType.GAME_BOARD,
             )
@@ -202,14 +221,8 @@ class IteratedPrisonersDilemmaEnv(ta.Env):
     # ---- prediction ------------------------------------------------------
 
     def _parse_prediction(self, action: str) -> Optional[str]:
-        # search inside <...> for "cooperate" / "defect"; fall back to whole action so a
-        # missing bracket still lets us score. But we only reward exact tagged match.
-        matches = self.prediction_pattern.findall(action)
-        for m in matches:
-            m_low = m.strip().lower()
-            if "cooperate" in m_low: return "cooperate"
-            if "defect" in m_low:    return "defect"
-        return None
+        match = self.prediction_pattern.fullmatch(action)
+        return match.group(1).lower() if match else None
 
     def _handle_prediction_phase(self, action: str):
         pred = self._parse_prediction(action)
@@ -222,8 +235,7 @@ class IteratedPrisonersDilemmaEnv(ta.Env):
             self.state.game_state["phase"] = "decision"
             self.state.add_observation(
                 message=(
-                    f"Predictions locked in. Now submit your decision "
-                    f"'[Cooperate]' or '[Defect]' for round {self.state.game_state['round']}."
+                    f"Predictions are locked in.\n{self._phase_instruction('decision')}"
                 ),
                 observation_type=ta.ObservationType.GAME_BOARD,
             )
@@ -231,18 +243,14 @@ class IteratedPrisonersDilemmaEnv(ta.Env):
     # ---- decision --------------------------------------------------------
 
     def _handle_decision_phase(self, action: str):
-        has_defect = bool(self.defect_pattern.search(action))
-        has_cooperate = bool(self.cooperate_pattern.search(action))
-        if has_defect == has_cooperate:
+        match = self.decision_pattern.fullmatch(action)
+        if match is None:
             self.state.step_info.setdefault("phase_format_valid_by_pid", {})[self.state.current_player_id] = False
-            reason = (
-                "Decision must contain exactly one of '[Cooperate]' or '[Defect]'."
-                if not has_defect
-                else "Decision contains both '[Cooperate]' and '[Defect]'; pick one."
+            self.state.set_invalid_move(
+                reason="Decision must be exactly '[Action: Cooperate]' or '[Action: Defect]'."
             )
-            self.state.set_invalid_move(reason=reason)
             return
-        decision = "defect" if has_defect else "cooperate"
+        decision = match.group(1).lower()
         self.state.step_info.setdefault("phase_format_valid_by_pid", {})[self.state.current_player_id] = True
         self.state.game_state["decisions"][self.state.current_player_id] = decision
 
@@ -261,7 +269,10 @@ class IteratedPrisonersDilemmaEnv(ta.Env):
                     "last_predictions": {},
                 })
                 self.state.add_observation(
-                    message=f"--- Starting Round {self.state.game_state['round']} ---",
+                    message=(
+                        f"--- Starting Round {self.state.game_state['round']} ---\n"
+                        f"{self._phase_instruction('conversation')}"
+                    ),
                     observation_type=ta.ObservationType.GAME_MESSAGE,
                 )
 
