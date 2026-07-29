@@ -28,6 +28,7 @@ class PlayerTrajectory:
     format_feedbacks:   List[Dict] = field(default_factory=list)
     step_infos:         List[Dict] = field(default_factory=list)
     step_rewards:       List[float] = field(default_factory=list)
+    step_reward_components: List[Dict[str, float]] = field(default_factory=list)
     step_phases:        List[Optional[str]] = field(default_factory=list)
     game_info:          Dict = field(default_factory=dict)
     num_turns:          int = field(default_factory=int)

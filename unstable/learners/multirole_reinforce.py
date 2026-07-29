@@ -5,19 +5,37 @@ from unstable.learners.utils import role_adapter_name
 from unstable.utils.context_window import completion_preserving_batch
 
 
+def _validated_phase_loss_weights(phase_loss_weights=None, normalize=True):
+    """Validate phase coefficients and optionally normalize them to sum to one."""
+    weights = {
+        phase: float(weight)
+        for phase, weight in (phase_loss_weights or {}).items()
+    }
+    if not weights:
+        return {}
+    if any(weight <= 0 for weight in weights.values()):
+        raise ValueError("phase_loss_weights must all be positive")
+    if normalize:
+        total = sum(weights.values())
+        weights = {phase: weight / total for phase, weight in weights.items()}
+    return weights
+
+
 @ray.remote
 class MultiRoleREINFORCELearner(MultiRoleBaseLearner):
-    def initialize_algorithm(self, max_train_len: int, max_generation_len: int, phase_loss_weights=None):
+    def initialize_algorithm(
+        self,
+        max_train_len: int,
+        max_generation_len: int,
+        phase_loss_weights=None,
+        normalize_phase_loss_weights: bool = True,
+    ):
         self.max_train_len = max_train_len
         self.max_generation_len = max_generation_len
-        self.phase_loss_weights = dict(phase_loss_weights or {})
-        if self.phase_loss_weights:
-            total = sum(float(weight) for weight in self.phase_loss_weights.values())
-            if total <= 0 or any(float(weight) <= 0 for weight in self.phase_loss_weights.values()):
-                raise ValueError("phase_loss_weights must all be positive")
-            self.phase_loss_weights = {
-                phase: float(weight) / total for phase, weight in self.phase_loss_weights.items()
-            }
+        self.phase_loss_weights = _validated_phase_loss_weights(
+            phase_loss_weights,
+            normalize=normalize_phase_loss_weights,
+        )
 
     def _prepare_batch(self, steps):
         obs, acts, advs = zip(*[(s.obs, s.act, s.reward) for s in steps])

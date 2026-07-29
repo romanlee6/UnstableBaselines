@@ -47,8 +47,26 @@ class PenaltyForInvalidMove(StepRewardTransform):
 class EnvStepReward(StepRewardTransform):
     """Adds per-step reward supplied by the env (via state.step_info["step_rewards_by_pid"]).
     Missing/empty step_rewards on the trajectory ⇒ no-op — safe for envs that don't opt in."""
-    def __init__(self, scale: float = 1.0): self.scale = scale
+    def __init__(
+        self,
+        scale: float = 1.0,
+        payoff_scale: float | None = None,
+        prediction_scale: float | None = None,
+    ):
+        self.scale = scale
+        self.component_scales = {
+            "payoff": scale if payoff_scale is None else payoff_scale,
+            "prediction": scale if prediction_scale is None else prediction_scale,
+        }
+
     def __call__(self, player_traj: PlayerTrajectory, step_index: int, reward: float) -> float:
+        components = getattr(player_traj, "step_reward_components", None)
+        if components and step_index < len(components) and components[step_index]:
+            reward += sum(
+                self.component_scales.get(name, self.scale) * float(value)
+                for name, value in components[step_index].items()
+            )
+            return reward
         sr = getattr(player_traj, "step_rewards", None)
         if sr and step_index < len(sr):
             reward += self.scale * float(sr[step_index])

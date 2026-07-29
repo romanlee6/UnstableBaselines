@@ -253,6 +253,8 @@ register_with_versions(id="IteratedTwoThirdsAverage-v0", entry_point="textarena.
 # IteratedStagHunt [2 Player]
 register_with_versions(id="IteratedStagHunt-v0",            entry_point="textarena.envs.IteratedStagHunt.env:IteratedStagHuntEnv", wrappers={"default": CONVERSATIONAL_WRAPPERS, "-train": CONVERSATIONAL_WRAPPERS}, num_rounds=5, conversation_rounds=3, mutual_stag_reward=10, single_hare_reward=8, single_stag_reward=1, mutual_hare_reward=5, randomize_payoff=False    )
 register_with_versions(id="IteratedStagHunt-v0-randomized", entry_point="textarena.envs.IteratedStagHunt.env:IteratedStagHuntEnv", wrappers={"default": CONVERSATIONAL_WRAPPERS, "-train": CONVERSATIONAL_WRAPPERS}, num_rounds=5, conversation_rounds=3, mutual_stag_reward=10, single_hare_reward=8, single_stag_reward=1, mutual_hare_reward=5, randomize_payoff=True     )
+register_with_versions(id="IteratedStagHunt-Broadcast-v0", entry_point="textarena.envs.IteratedStagHunt.env:IteratedStagHuntEnv", wrappers={"default": CONVERSATIONAL_WRAPPERS, "-train": CONVERSATIONAL_WRAPPERS}, num_rounds=5, conversation_rounds=3, mutual_stag_reward=10, single_hare_reward=8, single_stag_reward=1, mutual_hare_reward=5, randomize_payoff=False, enable_broadcast_comm=True, enable_prediction=False, use_step_rewards=True, typed_actions=True)
+register_with_versions(id="IteratedStagHunt-Predict-v0", entry_point="textarena.envs.IteratedStagHunt.env:IteratedStagHuntEnv", wrappers={"default": CONVERSATIONAL_WRAPPERS, "-train": CONVERSATIONAL_WRAPPERS}, num_rounds=5, conversation_rounds=3, mutual_stag_reward=10, single_hare_reward=8, single_stag_reward=1, mutual_hare_reward=5, randomize_payoff=False, enable_broadcast_comm=True, enable_prediction=True, use_step_rewards=True, prediction_reward=1.0, typed_actions=True)
 
 # KuhnPoker [2 Player]
 register_with_versions(id="KuhnPoker-v0",         entry_point="textarena.envs.KuhnPoker.env:KuhnPokerEnv", wrappers={"default": DEFAULT_WRAPPERS, "-train": BOARDGAME_WRAPPERS}, max_rounds=3   )
@@ -463,12 +465,12 @@ register_with_versions(id="Poker-v0-extreme",   entry_point="textarena.envs.Poke
 
 # PublicGoodsGame [Multiple Players]
 register_with_versions(id="PublicGoodsGame-v0", entry_point="textarena.envs.PublicGoodsGame.env:PublicGoodsGameEnv", wrappers={"default": DEFAULT_WRAPPERS, "-train": [GameMessagesObservationWrapper, ActionFormattingWrapper]}, num_rounds=3, communication_turns=3, endowment=20, multiplication_factor=1.5, num_players=3)
-# PublicGoodsGame-Predict: private prediction phase (predict aggregate pool) + per-round payoff and
+# PublicGoodsGame-Predict: private prediction of each opponent's contribution + per-round payoff and
 # prediction bonus emitted as per-step env reward (state.step_info["step_rewards_by_pid"]).
-register_with_versions(id="PublicGoodsGame-Predict-v0", entry_point="textarena.envs.PublicGoodsGame.env:PublicGoodsGameEnv", wrappers={"default": DEFAULT_WRAPPERS, "-train": [GameMessagesObservationWrapper, ActionFormattingWrapper]}, num_rounds=3, communication_turns=3, endowment=20, multiplication_factor=1.5, num_players=3, enable_prediction=True, use_step_rewards=True, prediction_reward=1.0)
+register_with_versions(id="PublicGoodsGame-Predict-v0", entry_point="textarena.envs.PublicGoodsGame.env:PublicGoodsGameEnv", wrappers={"default": DEFAULT_WRAPPERS, "-train": [GameMessagesObservationWrapper, ActionFormattingWrapper]}, num_rounds=3, communication_turns=3, endowment=20, multiplication_factor=1.5, num_players=3, enable_prediction=True, use_step_rewards=True, prediction_reward=1.0, typed_actions=True)
 # PublicGoodsGame-Broadcast: simultaneous {msg} broadcast is native to PGG; this variant just emits
 # per-round payoff via step_rewards_by_pid (no prediction phase).
-register_with_versions(id="PublicGoodsGame-Broadcast-v0", entry_point="textarena.envs.PublicGoodsGame.env:PublicGoodsGameEnv", wrappers={"default": DEFAULT_WRAPPERS, "-train": [GameMessagesObservationWrapper, ActionFormattingWrapper]}, num_rounds=3, communication_turns=3, endowment=20, multiplication_factor=1.5, num_players=2, enable_prediction=False, use_step_rewards=True, prediction_reward=0.0)
+register_with_versions(id="PublicGoodsGame-Broadcast-v0", entry_point="textarena.envs.PublicGoodsGame.env:PublicGoodsGameEnv", wrappers={"default": DEFAULT_WRAPPERS, "-train": [GameMessagesObservationWrapper, ActionFormattingWrapper]}, num_rounds=3, communication_turns=3, endowment=20, multiplication_factor=1.5, num_players=2, enable_prediction=False, use_step_rewards=True, prediction_reward=0.0, typed_actions=True)
 
 # Market Entry Game [Multiple Players]
 register_with_versions(id="MarketEntryGame-v0", entry_point="textarena.envs.MarketEntryGame.env:MarketEntryGameEnv", wrappers={"default": DEFAULT_WRAPPERS, "-train": [GameMessagesObservationWrapper, ActionFormattingWrapper]}, num_rounds=5, communication_turns=3, market_capacity=2, entry_profit=15, overcrowding_penalty=-5, safe_payoff=5, default_num_players=4)
@@ -481,6 +483,8 @@ register_with_versions(id="ThreePlayerGOPS-v0", entry_point="textarena.envs.Thre
 
 # ThreePlayerIPD [3 Player]
 register_with_versions(id="ThreePlayerIPD-v0", entry_point="textarena.envs.ThreePlayerIPD.env:ThreePlayerIPDEnv", wrappers={"default": CONVERSATIONAL_WRAPPERS, "-train": CONVERSATIONAL_WRAPPERS}, num_rounds=5, communication_turns=1, cooperate_reward=3, defect_reward=5, sucker_reward=0, mutual_defect_reward=1)
+register_with_versions(id="ThreePlayerIPD-Broadcast-v0", entry_point="textarena.envs.ThreePlayerIPD.env:ThreePlayerIPDEnv", wrappers={"default": CONVERSATIONAL_WRAPPERS, "-train": CONVERSATIONAL_WRAPPERS}, num_rounds=5, communication_turns=1, cooperate_reward=3, defect_reward=5, sucker_reward=0, mutual_defect_reward=1, enable_broadcast_comm=True, enable_prediction=False, use_step_rewards=True, typed_actions=True)
+register_with_versions(id="ThreePlayerIPD-Predict-v0", entry_point="textarena.envs.ThreePlayerIPD.env:ThreePlayerIPDEnv", wrappers={"default": CONVERSATIONAL_WRAPPERS, "-train": CONVERSATIONAL_WRAPPERS}, num_rounds=5, communication_turns=1, cooperate_reward=3, defect_reward=5, sucker_reward=0, mutual_defect_reward=1, enable_broadcast_comm=True, enable_prediction=True, use_step_rewards=True, prediction_reward=1.0, typed_actions=True)
 
 # Character Conclave [3-15 Players]
 register_with_versions(id="CharacterConclave-v0",         entry_point="textarena.envs.CharacterConclave.env:CharacterConclaveEnv", wrappers={"default": [LLMObservationWrapper], "-train": [LLMObservationWrapper]}, character_budget=1_000     )

@@ -88,9 +88,22 @@ class Tracker(BaseTracker):
                 self._put(f"{phase_prefix}/invalid_move", bool(feedback.get("invalid_move")))
                 env_reward = float(traj.step_rewards[idx]) if idx < len(traj.step_rewards) else 0.0
                 self._put(f"{phase_prefix}/environment_reward", env_reward)
+                reward_components = (
+                    traj.step_reward_components[idx]
+                    if idx < len(traj.step_reward_components)
+                    else {}
+                )
+                for name, value in reward_components.items():
+                    self._put(f"{phase_prefix}/environment_reward/{name}", float(value))
                 action = traj.extracted_actions[idx] if idx < len(traj.extracted_actions) else ""
                 if phase == "prediction":
-                    self._put(f"{phase_prefix}/accuracy", env_reward > 0)
+                    info = traj.step_infos[idx] if idx < len(traj.step_infos) else {}
+                    if "prediction_score" in info:
+                        self._put(f"{phase_prefix}/score", float(info["prediction_score"]))
+                    if "prediction_exact_rate" in info:
+                        self._put(f"{phase_prefix}/accuracy", float(info["prediction_exact_rate"]))
+                    if "prediction_mae" in info:
+                        self._put(f"{phase_prefix}/mae", float(info["prediction_mae"]))
                 if phase == "decision":
                     cooperate = "[cooperate]" in action.lower()
                     defect = "[defect]" in action.lower()
@@ -99,6 +112,10 @@ class Tracker(BaseTracker):
                     info = traj.step_infos[idx] if idx < len(traj.step_infos) else {}
                     if "mutual_cooperation" in info:
                         self._put(f"{phase_prefix}/mutual_cooperation", bool(info["mutual_cooperation"]))
+                    if "round_payoff" in info:
+                        self._put(f"{phase_prefix}/round_payoff", float(info["round_payoff"]))
+                    if "cumulative_score" in info:
+                        self._put(f"{phase_prefix}/cumulative_score", float(info["cumulative_score"]))
             self._n[f"collection-{env_id}"] = self._n.get(f"collection-{env_id}", 0) + 1
             self._put(f"collection-{env_id}/step", self._n[f"collection-{env_id}"])
             self._buffer.update(self._agg('collection-')); self._flush_if_due()
@@ -114,6 +131,23 @@ class Tracker(BaseTracker):
             self._put(f"{_prefix}/Win Rate",  int(eval_reward>0))
             self._put(f"{_prefix}/Loss Rate", int(eval_reward<0))
             self._put(f"{_prefix}/Draw Rate", int(eval_reward==0))
+            for step_info in game_information.step_infos:
+                round_metrics = (step_info or {}).get("round_metrics_by_pid") or {}
+                if game_information.eval_model_pid in round_metrics:
+                    metrics = round_metrics[game_information.eval_model_pid]
+                    if "round_payoff" in metrics:
+                        self._put(f"{_prefix}/Round Payoff", float(metrics["round_payoff"]))
+                    if "cumulative_score" in metrics:
+                        self._put(f"{_prefix}/Cumulative Score", float(metrics["cumulative_score"]))
+                prediction_metrics = (step_info or {}).get("prediction_metrics_by_pid") or {}
+                if game_information.eval_model_pid in prediction_metrics:
+                    metrics = prediction_metrics[game_information.eval_model_pid]
+                    if "prediction_score" in metrics:
+                        self._put(f"{_prefix}/Prediction Score", float(metrics["prediction_score"]))
+                    if "prediction_exact_rate" in metrics:
+                        self._put(f"{_prefix}/Prediction Accuracy", float(metrics["prediction_exact_rate"]))
+                    if "prediction_mae" in metrics:
+                        self._put(f"{_prefix}/Prediction MAE", float(metrics["prediction_mae"]))
             self._n[_prefix] = self._n.get(_prefix, 0) + 1
             self._put(f"{_prefix}/step", self._n[_prefix])
             self._buffer.update(self._agg('evaluation-')); self._flush_if_due()

@@ -1,0 +1,58 @@
+{
+  "convergence_update_15pct": {
+    "Vanilla": 63,
+    "Broadcast": 190,
+    "Predict": 38
+  },
+  "self_play_terminal_reward_endpoint": {
+    "Vanilla": [
+      0.0505859375,
+      -0.0505859375
+    ],
+    "Broadcast": [
+      -0.969921875,
+      0.969921875
+    ],
+    "Predict": [
+      0.008984375,
+      -0.0087890625
+    ]
+  },
+  "unseen_agent_reward_endpoint": {
+    "Vanilla": -0.65859375,
+    "Broadcast": -0.973828125,
+    "Predict": -0.0283203125
+  },
+  "predict_mutual_cooperation_endpoint": 0.9845703125,
+  "predict_prediction_accuracy_endpoint": {
+    "role_0": 0.9890625,
+    "role_1": 0.9869140625
+  },
+  "run_metadata": {
+    "Vanilla": {
+      "id": "xjnxzwn9",
+      "name": "UB-multirole-reinforce-Qwen3-4B-Base-IteratedPrisonersDilemma-v0-train-1783024814",
+      "state": "crashed",
+      "url": "https://wandb.ai/huaol-massachusetts-institute-of-technology/UnstableBaselines/runs/xjnxzwn9"
+    },
+    "Broadcast": {
+      "id": "asl7pl50",
+      "name": "UB-multirole-reinforce-Qwen3-4B-Base-IteratedPrisonersDilemma-Broadcast-v0-train-noshuffle-1783457248",
+      "state": "crashed",
+      "url": "https://wandb.ai/huaol-massachusetts-institute-of-technology/UnstableBaselines/runs/asl7pl50"
+    },
+    "Predict": {
+      "id": "ub-ipd-typed-recent-200-18994851",
+      "name": "UB-multirole-reinforce-Qwen3-4B-Base-IPD-Predict-typed-recent-context-200-18994851",
+      "state": "crashed",
+      "url": "https://wandb.ai/huaol-massachusetts-institute-of-technology/UnstableBaselines/runs/ub-ipd-typed-recent-200-18994851"
+    }
+  },
+  "limitations": [
+    "Vanilla and Broadcast do not log actions, so symmetric terminal outcomes cannot distinguish CC from DD.",
+    "Unseen opponents differ: Vanilla/Broadcast use Gemini 3.1 Flash Lite; Predict uses DeepSeek-V4-flash.",
+    "All curves are single-run descriptive results; no seed-level uncertainty intervals are available.",
+    "Logged collection metrics are rolling means over up to 512 samples, so transitions are intentionally lagged.",
+    "The Predict cooperate/defect scalar keys are malformed by a tracker substring check and are excluded; mutual_cooperation comes from environment step_info."
+  ]
+}

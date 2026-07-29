@@ -16,6 +16,7 @@ class PublicGoodsGameEnv(ta.Env):
                  use_step_rewards: bool = False,         # write per-round payoff into state.step_info["step_rewards_by_pid"]
                  prediction_reward: float = 1.0,         # scale of the best-case prediction bonus
                  prediction_tolerance: Optional[int] = None,  # error window (default = endowment)
+                 typed_actions: bool = False,
                  ):
         """
         Initialize the Public Goods Game environment.
@@ -35,6 +36,8 @@ class PublicGoodsGameEnv(ta.Env):
             prediction_reward: Scalar peak reward for a perfect prediction.
             prediction_tolerance: Error window in tokens; reward decays linearly to 0 at
                 this error. Defaults to `endowment` if None.
+            typed_actions: Require phase-specific [Message: ...], [Prediction: ...],
+                and [Action: ...] commands when enabled.
         """
         self.num_rounds = num_rounds
         self.communication_turns = communication_turns
@@ -46,6 +49,7 @@ class PublicGoodsGameEnv(ta.Env):
         self.use_step_rewards = use_step_rewards
         self.prediction_reward = prediction_reward
         self.prediction_tolerance = prediction_tolerance if prediction_tolerance is not None else endowment
+        self.typed_actions = typed_actions
 
         # Action regex - matches numbers in brackets like [15] or [0]
         self.contribution_pattern = re.compile(r"\[(\d+)\]", re.IGNORECASE)
@@ -53,8 +57,16 @@ class PublicGoodsGameEnv(ta.Env):
         # Public message regex - matches messages in curly braces like {Hello everyone!}
         self.public_message_pattern = re.compile(r"\{([^}]*)\}", re.DOTALL)
 
-        # Prediction regex - matches integer prediction in <N>
-        self.prediction_pattern = re.compile(r"<\s*(\d+)\s*>", re.DOTALL)
+        self.typed_message_pattern = re.compile(
+            r"^\s*\[Message\s*:\s*(.*?)\s*\]\s*$", re.IGNORECASE | re.DOTALL
+        )
+        self.typed_action_pattern = re.compile(
+            r"^\s*\[Action\s*:\s*(\d+)\s*\]\s*$", re.IGNORECASE
+        )
+        self.prediction_pattern = re.compile(
+            r"^\s*\[Prediction\s*:\s*(.*?)\s*\]\s*$", re.IGNORECASE | re.DOTALL
+        )
+        self.prediction_entry_pattern = re.compile(r"P(\d+)\s*=\s*(\d+)", re.IGNORECASE)
 
     def get_board_str(self):
         gs = self.state.game_state
@@ -109,12 +121,13 @@ class PublicGoodsGameEnv(ta.Env):
 
         pred_block = ""
         if self.enable_prediction:
-            max_pool = self.endowment * self.state.num_players
+            opponents = [pid for pid in range(self.state.num_players) if pid != player_id]
+            example = ", ".join(f"P{pid}=10" for pid in opponents)
             pred_block = (
-                f"- Prediction phase (private): after conversation, privately predict the "
-                f"TOTAL contribution pooled by all alive players this round (an integer "
-                f"between 0 and {max_pool}). Respond with '<N>'. Correct predictions earn "
-                f"up to +{self.prediction_reward}, decaying linearly to 0 at ±{self.prediction_tolerance} error.\n"
+                f"- Prediction phase (private): predict each opponent's contribution as "
+                f"'[Prediction: {example}]'. Each prediction is scored from 0 to 1, "
+                f"decaying linearly to 0 at ±{self.prediction_tolerance} error; scores are "
+                f"averaged for a maximum bonus of +{self.prediction_reward}.\n"
             )
 
         return (
@@ -141,17 +154,30 @@ class PublicGoodsGameEnv(ta.Env):
             f"How to Play:\n"
             f"- You can think internally and reason about your strategy (this won't be shared).\n"
             f"- Your goal is to maximize your total score across all rounds.\n"
-            f"- During conversation: send public messages using {{message}} format.\n"
-            f"  Example: 'I think we should cooperate. {{Let me propose we all contribute 15 tokens}}'\n"
-            f"  Only the text in curly braces will be visible to other players.\n"
-            f"- During decision phase: include '[X]' where X is your contribution (0-{game_state['endowment']}).\n"
-            f"  Example: 'Based on the discussion, I will contribute [15] tokens to the public good.'\n"
-            f"- Invalid moves (wrong format or out of range) will result in warnings, then elimination.\n"
-            f"- If you don't send any public message during conversation (no {{}} format), others will see that you remained silent.\n"
+            f"- During conversation: send "
+            + ("exactly '[Message: your public message]'.\n" if self.typed_actions else "public messages using {message} format.\n")
+            + f"- During decision phase: submit "
+            + (f"exactly '[Action: X]' where X is 0-{game_state['endowment']}.\n" if self.typed_actions else f"'[X]' where X is 0-{game_state['endowment']}.\n")
+            + f"- Invalid moves (wrong format or out of range) will result in warnings, then elimination.\n"
+            f"- Invalid conversation output is treated as public silence.\n"
             + pred_block +
             f"\nGame Status: \n"
             f"{phase_round_description}\n"
+            + self._phase_instruction(player_id, game_state)
         )
+
+    def _phase_instruction(self, player_id: int, game_state: Dict[str, Any]) -> str:
+        if not self.typed_actions:
+            return ""
+        phase = game_state["phase"]
+        if phase == "conversation":
+            required = "Reply with exactly one command: [Message: your public message]"
+        elif phase == "prediction":
+            opponents = [pid for pid in range(self.state.num_players) if pid != player_id]
+            required = "Reply with exactly one command containing every opponent: [Prediction: " + ", ".join(f"P{pid}=integer" for pid in opponents) + "]"
+        else:
+            required = f"Reply with exactly one command: [Action: integer from 0 to {self.endowment}]"
+        return f"CURRENT PHASE: {phase.upper()} (round {game_state['round']}).\nREQUIRED OUTPUT: {required}"
 
     def step(self, action: str) -> Tuple[bool, ta.Info]:
         self.state.add_observation(
@@ -173,6 +199,9 @@ class PublicGoodsGameEnv(ta.Env):
 
     def _extract_public_message(self, action: str) -> Optional[str]:
         """Extract and validate public message from action using {message} format."""
+        if self.typed_actions:
+            match = self.typed_message_pattern.fullmatch(action)
+            return match.group(1).strip() if match and match.group(1).strip() else None
         matches = self.public_message_pattern.findall(action)
         if matches:
             valid_messages = [match.strip() for match in matches if match.strip()]
@@ -227,7 +256,6 @@ class PublicGoodsGameEnv(ta.Env):
         if self.enable_prediction:
             self.state.game_state["phase"] = "prediction"
             self.state.game_state["pending_predictions"] = {}
-            max_pool = self.state.game_state["endowment"] * len(alive_players)
             # send a PRIVATE prompt to each alive player individually
             for pid in alive_players:
                 self.state.add_observation(
@@ -235,10 +263,8 @@ class PublicGoodsGameEnv(ta.Env):
                     from_id=ta.GAME_ID,
                     message=(
                         f"Prediction phase for round {self.state.game_state['round']} (private).\n"
-                        f"Predict the TOTAL contribution across all {len(alive_players)} alive players "
-                        f"this round as '<N>' (integer 0..{max_pool}). "
-                        f"Best-case reward +{self.prediction_reward}, decays linearly to 0 at "
-                        f"±{self.prediction_tolerance} error."
+                        f"Predict every opponent's contribution this round. "
+                        f"{self._phase_instruction(pid, self.state.game_state)}"
                     ),
                     observation_type=ta.ObservationType.GAME_BOARD,
                 )
@@ -252,15 +278,20 @@ class PublicGoodsGameEnv(ta.Env):
             )
 
     def _handle_prediction_phase(self, action: str):
-        # parse first integer inside <...>; None if unparseable
-        m = self.prediction_pattern.search(action)
-        pred = int(m.group(1)) if m else None
+        cid = self.state.current_player_id
         alive_players = [p for p in range(self.state.num_players) if self.state.is_player_alive(p)]
-        max_pool = self.state.game_state["endowment"] * len(alive_players)
-        if pred is not None and not 0 <= pred <= max_pool:
-            pred = None
-        self.state.step_info.setdefault("phase_format_valid_by_pid", {})[self.state.current_player_id] = pred is not None
-        self.state.game_state["pending_predictions"][self.state.current_player_id] = pred
+        expected = {p for p in alive_players if p != cid}
+        match = self.prediction_pattern.fullmatch(action)
+        entries = self.prediction_entry_pattern.findall(match.group(1)) if match else []
+        parsed = {int(pid): int(value) for pid, value in entries}
+        valid = (
+            match is not None
+            and len(entries) == len(expected)
+            and set(parsed) == expected
+            and all(0 <= value <= self.endowment for value in parsed.values())
+        )
+        self.state.step_info.setdefault("phase_format_valid_by_pid", {})[cid] = valid
+        self.state.game_state["pending_predictions"][cid] = parsed if valid else {}
 
         if all(p in self.state.game_state["pending_predictions"] for p in alive_players):
             self.state.game_state["last_predictions"] = dict(self.state.game_state["pending_predictions"])
@@ -276,7 +307,11 @@ class PublicGoodsGameEnv(ta.Env):
 
     def _handle_decision_phase(self, action: str):
         # Extract contribution amount
-        match = self.contribution_pattern.search(action)
+        match = (
+            self.typed_action_pattern.fullmatch(action)
+            if self.typed_actions
+            else self.contribution_pattern.search(action)
+        )
         if match:
             contribution = int(match.group(1))
             # Validate contribution
@@ -403,18 +438,28 @@ class PublicGoodsGameEnv(ta.Env):
         # Prediction scoring — private per-player result observation + bonus
         if self.enable_prediction:
             for pid in alive_players:
-                predicted = self.state.game_state["last_predictions"].get(pid)
-                if predicted is None:
-                    bonus = 0.0
-                    note = f"Your prediction was unparseable; actual total was {int(total_contribution)}."
-                else:
-                    error = abs(int(predicted) - int(total_contribution))
-                    bonus = float(self.prediction_reward) * max(0.0, 1.0 - error / max(1, self.prediction_tolerance))
-                    note = (
-                        f"Your prediction was {predicted}; actual total was {int(total_contribution)} "
-                        f"(error {error}). Bonus +{bonus:.3f}."
-                    )
-                step_rewards[pid] = step_rewards.get(pid, 0.0) + bonus
+                predicted = self.state.game_state["last_predictions"].get(pid, {})
+                opponents = [other for other in alive_players if other != pid]
+                errors = [
+                    abs(predicted.get(other, -self.endowment) - contributions.get(other, 0))
+                    for other in opponents
+                ]
+                scores = [
+                    max(0.0, 1.0 - error / max(1, self.prediction_tolerance))
+                    for error in errors
+                ]
+                score = sum(scores) / len(scores) if scores else 0.0
+                exact_rate = (
+                    sum(error == 0 for error in errors) / len(errors) if errors else 0.0
+                )
+                mae = sum(errors) / len(errors) if errors else 0.0
+                bonus = float(self.prediction_reward) * score
+                note = f"Opponent prediction score {score:.3f}; mean error {mae:.3f}; bonus +{bonus:.3f}."
+                self.state.step_info.setdefault("prediction_metrics_by_pid", {})[pid] = {
+                    "prediction_score": score,
+                    "prediction_exact_rate": exact_rate,
+                    "prediction_mae": mae,
+                }
                 self.state.add_observation(
                     to_id=pid,
                     from_id=ta.GAME_ID,
@@ -429,9 +474,18 @@ class PublicGoodsGameEnv(ta.Env):
             })
             if self.enable_prediction:
                 self.state.step_info["prediction_rewards_by_pid"] = {
-                    pid: step_rewards[pid] - round_info["payoffs"][pid]
+                    pid: float(self.prediction_reward) * self.state.step_info[
+                        "prediction_metrics_by_pid"
+                    ][pid]["prediction_score"]
                     for pid in alive_players
                 }
+        self.state.step_info["round_metrics_by_pid"] = {
+            pid: {
+                "round_payoff": float(round_info["payoffs"][pid]),
+                "cumulative_score": float(self.state.game_state["total_scores"][pid]),
+            }
+            for pid in alive_players
+        }
 
         # Announce results
         self.state.add_observation(

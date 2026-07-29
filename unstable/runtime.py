@@ -122,11 +122,15 @@ def build_multirole(*, model_name: str, role_pids: Sequence[int], train_envs: Se
                     wandb_project: str="UnstableBaselines",
                     run_name_suffix: Optional[str]=None,
                     env_step_reward_scale: float=1.0,
+                    payoff_reward_scale: Optional[float]=None,
+                    prediction_reward_scale: Optional[float]=None,
+                    terminal_reward_scale: float=1.0,
                     include_final_reward: bool=True,
                     include_invalid_move_reward: bool=True,
                     balanced_phases: Optional[Sequence[str]]=None,
                     phase_local_normalization: bool=False,
                     phase_loss_weights: Optional[dict]=None,
+                    normalize_phase_loss_weights: bool=True,
                     initial_step: int=1,
                     initial_samples_seen: Optional[dict]=None,
                     initial_training_state_path: Optional[str]=None,
@@ -142,6 +146,9 @@ def build_multirole(*, model_name: str, role_pids: Sequence[int], train_envs: Se
       LoraConfig kwargs per pid; if a pid is missing, _DEFAULT_LORA_CFG is broadcast.
     - eval_substitutions = {pid: model_name} swaps that pid's LoRA for an external
       model during eval games. eval_provider selects "openrouter" or "azure_ai".
+    - payoff_reward_scale, prediction_reward_scale, and terminal_reward_scale
+      independently control the three environment reward sources. Unspecified
+      step component scales fall back to env_step_reward_scale.
     - algorithm: 'reinforce' | 'a2c' | 'ppo' | 'grpo'. 'a2c' and 'ppo' use per-role
       EpisodeBuffers (needed for GAE); 'reinforce' and 'grpo' use per-role StepBuffers.
     """
@@ -204,15 +211,25 @@ def build_multirole(*, model_name: str, role_pids: Sequence[int], train_envs: Se
     use_episode = algorithm in _MULTIROLE_EPISODE_ALGOS
     BufferCls = unstable.EpisodeBuffer if use_episode else unstable.StepBuffer
 
-    final_xforms = [] if algorithm == "grpo" or not include_final_reward else [retra.RoleAdvantageByEnvFormatter()]
+    final_xforms = [] if algorithm == "grpo" or not include_final_reward else [
+        retra.RoleAdvantageByEnvFormatter(scale=terminal_reward_scale)
+    ]
     step_xforms = [retra.RewardForFormat(1.5)]
     if include_invalid_move_reward:
         step_xforms.append(retra.PenaltyForInvalidMove(1.0, -1.0))
-    step_xforms.append(retra.EnvStepReward(env_step_reward_scale))
-    if env_step_reward_scale != 0.0 and not use_turn_scores:
+    step_xforms.append(retra.EnvStepReward(
+        env_step_reward_scale,
+        payoff_scale=payoff_reward_scale,
+        prediction_scale=prediction_reward_scale,
+    ))
+    effective_step_scales = (
+        env_step_reward_scale if payoff_reward_scale is None else payoff_reward_scale,
+        env_step_reward_scale if prediction_reward_scale is None else prediction_reward_scale,
+    )
+    if any(scale != 0.0 for scale in effective_step_scales) and not use_turn_scores:
         import warnings
         warnings.warn(
-            "env_step_reward_scale is non-zero but use_turn_scores=False; "
+            "An environment step-reward scale is non-zero but use_turn_scores=False; "
             "per-step env rewards will be discarded by the learner. "
             "Set use_turn_scores=True to keep them.",
             RuntimeWarning, stacklevel=2,
@@ -263,7 +280,8 @@ def build_multirole(*, model_name: str, role_pids: Sequence[int], train_envs: Se
         case "reinforce":
             ray.get(learner.initialize_algorithm.remote(
                 max_train_len=max_train_len, max_generation_len=max_generation_len,
-                phase_loss_weights=phase_loss_weights))
+                phase_loss_weights=phase_loss_weights,
+                normalize_phase_loss_weights=normalize_phase_loss_weights))
         case "a2c":
             ray.get(learner.initialize_algorithm.remote(
                 max_train_len=max_train_len, max_generation_len=max_generation_len,

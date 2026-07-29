@@ -79,6 +79,7 @@ def run_game(game_spec: GameSpec, actor: VLLMActor):
             if phase_valid is not None: format_feedback["phase_format_valid"] = bool(phase_valid)
             agents[pid]["traj"].format_feedbacks.append(format_feedback); agents[pid]["traj"].step_infos.append(step_info)
             agents[pid]["traj"].step_rewards.append(0.0)
+            agents[pid]["traj"].step_reward_components.append({})
             agents[pid]["traj"].step_phases.append(phase)
         # distribute per-step env rewards keyed by pid (contract: env writes
         # state.step_info["step_rewards_by_pid"] = {pid: float, ...}); missing/empty = no-op.
@@ -89,6 +90,9 @@ def run_game(game_spec: GameSpec, actor: VLLMActor):
             t = agents.get(tgt_pid, {}).get("traj")
             if t is not None and t.step_rewards:
                 t.step_rewards[-1] += float(r)
+                t.step_reward_components[-1]["payoff"] = (
+                    t.step_reward_components[-1].get("payoff", 0.0) + float(r)
+                )
         # Prediction bonuses are resolved only after decisions are known, but
         # belong to the earlier prediction completion rather than the decision.
         prp = (step_info or {}).get("prediction_rewards_by_pid") or {}
@@ -98,7 +102,25 @@ def run_game(game_spec: GameSpec, actor: VLLMActor):
             for idx in range(len(t.step_phases) - 1, -1, -1):
                 if t.step_phases[idx] == "prediction":
                     t.step_rewards[idx] += float(r)
+                    t.step_reward_components[idx]["prediction"] = (
+                        t.step_reward_components[idx].get("prediction", 0.0) + float(r)
+                    )
                     break
+        # Attach structured, non-reward diagnostics to the phase completion that
+        # produced them. Environments can add game-specific fields without
+        # requiring collector changes.
+        for payload_key, target_phase in (
+            ("round_metrics_by_pid", "decision"),
+            ("prediction_metrics_by_pid", "prediction"),
+        ):
+            for tgt_pid, metrics in ((step_info or {}).get(payload_key) or {}).items():
+                t = agents.get(tgt_pid, {}).get("traj")
+                if t is None:
+                    continue
+                for idx in range(len(t.step_phases) - 1, -1, -1):
+                    if t.step_phases[idx] == target_phase:
+                        t.step_infos[idx] = dict(t.step_infos[idx] or {}, **dict(metrics))
+                        break
         # Round outcomes are known only after both decisions. Attach them to
         # each player's corresponding decision completion for phase metrics.
         if (step_info or {}).get("round_decisions_by_pid") is not None:

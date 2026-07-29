@@ -20,10 +20,12 @@ def _apply_env_rewards(trajs, step_info):
     for tgt, r in ((step_info or {}).get("step_rewards_by_pid") or {}).items():
         if trajs[tgt].step_rewards:
             trajs[tgt].step_rewards[-1] += float(r)
+            trajs[tgt].step_reward_components[-1]["payoff"] = float(r)
     for tgt, r in ((step_info or {}).get("prediction_rewards_by_pid") or {}).items():
         for i in range(len(trajs[tgt].step_phases) - 1, -1, -1):
             if trajs[tgt].step_phases[i] == "prediction":
                 trajs[tgt].step_rewards[i] += float(r)
+                trajs[tgt].step_reward_components[i]["prediction"] = float(r)
                 break
 
 
@@ -44,6 +46,7 @@ def run_scripted_game(env_id: str, actions_by_pid: dict, num_players: int):
         trajs[pid].format_feedbacks.append({"correct_answer_format": True, "invalid_move": False})
         trajs[pid].step_infos.append(step_info)
         trajs[pid].step_rewards.append(0.0)
+        trajs[pid].step_reward_components.append({})
         trajs[pid].step_phases.append(phase)
         _apply_env_rewards(trajs, step_info)
         if done: break
@@ -75,6 +78,7 @@ def test_ipd_predict_collector_flow():
         trajs[pid].format_feedbacks.append({"correct_answer_format": True, "invalid_move": False})
         trajs[pid].step_infos.append(step_info)
         trajs[pid].step_rewards.append(0.0)
+        trajs[pid].step_reward_components.append({})
         trajs[pid].step_phases.append(phase)
         _apply_env_rewards(trajs, step_info)
         if done: break
@@ -93,6 +97,9 @@ def test_ipd_predict_collector_flow():
         for i, sr in enumerate(trajs[pid].step_rewards):
             got = xform(trajs[pid], i, 0.0)
             assert got == sr, (pid, i, sr, got)
+    ablation = EnvStepReward(scale=1.0, payoff_scale=0.0, prediction_scale=2.0)
+    assert ablation(trajs[0], 1, 0.0) == 2.0
+    assert ablation(trajs[0], 2, 0.0) == 0.0
 
 
 def test_boxed_payload_is_preserved():
